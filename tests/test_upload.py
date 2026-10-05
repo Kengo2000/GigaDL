@@ -283,6 +283,27 @@ try:
 except uploader.UploadError:
     check(True, "5文字以上のパスワードを拒否")
 
+# 5b) 中身を送り終えた直後に一時停止しても、その分は取り消さない
+ev = threading.Event()
+bf = tmp / "body.bin"
+bf.write_bytes(b"x" * 1000)
+cb = uploader.ChunkBody([("id", "a"), ("lifetime", "7")], bf, 0, 1000, lambda n: None, ev)
+got = cb.read(); got += cb.read(); got += cb.read()
+ev.set()
+try:
+    end = cb.read()
+    check(end == b"" and got.endswith(b"--\r\n"), "送り終えた後の一時停止で送信を壊さない")
+except uploader.Stopped:
+    check(False, "送り終えた後の一時停止で送信を壊さない")
+cb2 = uploader.ChunkBody([("id", "a"), ("lifetime", "7")], bf, 0, 1000, lambda n: None, ev)
+cb2.read()
+try:
+    cb2.read()
+    check(False, "送っている途中なら一時停止できる")
+except uploader.Stopped:
+    check(True, "送っている途中なら一時停止できる")
+cb2.close()
+
 # 6) 相手に送る文面
 txt = uploader.share_text(added)
 check(all(t.url in txt for t in added) and "パスワード: ab12" in txt, "相手に送る文面を作れる")

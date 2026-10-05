@@ -83,7 +83,9 @@ class ChunkBody:
         return self.length
 
     def read(self, n=-1):
-        if self.stop.is_set():
+        # 一時停止はファイルの中身を送っている途中でだけ受け付ける。
+        # 最後まで送り終えた後に止めると、サーバーは受け取ったのにこちらは未送信扱いになるため。
+        if self.stop.is_set() and self.stage <= 1 and self.remaining > 0:
             raise Stopped()
         if self.stage == 0:
             self.stage = 1
