@@ -98,7 +98,7 @@ if ($py) {
 
 # ------------------------------------------------------------ 配置と仮想環境
 New-Item -ItemType Directory -Force -Path $AppCode | Out-Null
-foreach ($f in 'engine.py', 'gigadl.py', 'platform_util.py', 'make_icon.py') {
+foreach ($f in 'engine.py', 'gigadl.py', 'platform_util.py', 'make_icon.py', 'uploader.py', 'upload_ui.py') {
     Copy-Item -Force (Join-Path $Src $f) $AppCode
 }
 
@@ -135,7 +135,7 @@ foreach ($lnk in $targets) {
     $s.TargetPath = $vpyw
     $s.Arguments = '"' + (Join-Path $AppCode 'gigadl.py') + '"'
     $s.WorkingDirectory = $AppCode
-    $s.Description = 'ギガファイル便ダウンローダー'
+    $s.Description = 'ギガファイル便ダウンローダー / アップローダー'
     if (Test-Path $ico) { $s.IconLocation = $ico }
     $s.Save()
 }

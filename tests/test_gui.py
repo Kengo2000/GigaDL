@@ -25,6 +25,7 @@ os.environ["APPDATA"] = str(TMP / "appdata")
 os.environ["XDG_DATA_HOME"] = str(TMP / "xdg")
 
 DATA = {"9001-alpha": os.urandom(4 * 1024 * 1024), "9001-beta": os.urandom(6 * 1024 * 1024)}
+UP = {"next": {}, "buf": {}, "files": {}}
 NAMES = {"9001-alpha": "日本語ファイル.mov", "9001-beta": "beta.mp4"}
 
 
@@ -43,10 +44,40 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        import re as _re
+        n = int(self.headers["Content-Length"])
+        body = self.rfile.read(n)
+        b = _re.search(r"boundary=(.+)", self.headers["Content-Type"])[1].encode()
+        f = {}
+        for part in body.split(b"--" + b):
+            head, _, data = part.partition(b"\r\n\r\n")
+            m = _re.search(rb'name="([^"]+)"', head)
+            if m:
+                f[m[1].decode()] = data[:-2]
+        uid, idx, total = f["id"].decode(), int(f["chunk"]), int(f["chunks"])
+        if UP["next"].get(uid, 0) != idx:
+            return self._send(200, "application/json", b'{"status":1,"message":"order"}')
+        UP["buf"][uid] = UP["buf"].get(uid, b"") + f["file"]
+        UP["next"][uid] = idx + 1
+        if idx + 1 < total:
+            return self._send(200, "application/json", b'{"status":0}')
+        page = "9100-" + uid[:8]
+        DATA[page] = UP["buf"][uid]
+        NAMES[page] = f["name"].decode()
+        UP["files"]["srv" + uid[:6]] = {"page": page, "dlkey": None}
+        out = {"status": 0, "url": f"https://53.gigafile.nu/{page}", "filename": "srv" + uid[:6], "delkey": "dk"}
+        return self._send(200, "application/json", json.dumps(out).encode())
+
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         pid = u.path.strip("/")
+        if pid == "":
+            return self._send(200, "text/html", b'<script>var server = "53.gigafile.nu";</script>')
+        if u.path == "/set_dlkey.php":
+            UP["files"][q["file"][0]]["dlkey"] = q["dlkey"][0]
+            return self._send(200, "application/json", b'{"status":0}')
         if pid in DATA:
             html = f'<div id="dl">{NAMES[pid]}</div><span class="dl_size">1 MB</span>'
             return self._send(200, "text/html; charset=utf-8", html.encode())
@@ -82,6 +113,8 @@ import requests  # noqa: E402
 from requests.adapters import HTTPAdapter  # noqa: E402
 
 import engine  # noqa: E402
+import uploader  # noqa: E402
+uploader.UP_CHUNK = 1024 * 1024
 
 
 class Local(HTTPAdapter):
@@ -193,8 +226,37 @@ check(w.table.rowCount() == 0, "完了を一覧から消す")
 st = json.loads(Path(gigadl.STATE).read_text("utf-8"))
 check(str(dl2) in st["settings"].get("recent_dirs", []), "最近のフォルダが保存される")
 
-# --- 終了（確認ダイアログが出ない状態で閉じられる）
+# --- アップロードのタブ
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Ok)
+w.tabs.setCurrentIndex(1)
+pump(0.5)
+shot("4_アップロード画面")
+movie = TMP / "送る素材.mov"
+movie.write_bytes(os.urandom(5 * 1024 * 1024 + 9))
+w.up_tab.lifetime.setCurrentIndex(w.up_tab.lifetime.findData(14))
+w.up_tab.key.setText("x1")
+w.up_tab.add_paths([str(movie)])
+check(wait_for(lambda: w.up_tab.table.rowCount() == 1, 10), "アップロード一覧に追加")
+pump(0.6)
+shot("5_アップロード中")
+ut = w.up.tasks[0]
+check(wait_for(lambda: ut.status == uploader.DONE, 60), f"アップロード完了 {ut.message}")
+pump(0.4)
+shot("6_アップロード完了")
+page = ut.url.rsplit("/", 1)[1]
+check(DATA.get(page) == movie.read_bytes(), "相手側で元の1ファイルに戻っている")
+check(any(v["dlkey"] == "x1" for v in UP["files"].values()), "パスワードが設定される")
+check(ut.lifetime == 14, "保持期限14日")
+check(w.up_tab.table.item(0, 6).text() == ut.url, "URLの列に表示")
+w.up_tab.table.selectRow(0)
+w.up_tab.act_share()
+clip = QApplication.clipboard().text()
+check(ut.url in clip and "パスワード: x1" in clip and "14日" in clip, "送る文面をコピー")
+check(any(n[0] == "アップロード完了" for n in NOTES), "アップロード完了の通知")
+w.grab_clipboard()
+check(ut.url not in w.urls.toPlainText(), "自分のアップロードURLをダウンロード欄に入れない")
+
+# --- 終了（確認ダイアログが出ない状態で閉じられる）
 w.close()
 pump(0.3)
 check(not w.isVisible(), "ウィンドウを閉じられる")

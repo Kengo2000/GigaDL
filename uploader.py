@@ -1,0 +1,545 @@
+"""
+GigaDL アップロード部
+ギガファイル便の公式アップローダー（gfupload / upload.js）と同じ手順で送る:
+  1. トップページから送信先サーバーを取得（var server = "NN.gigafile.nu"）
+  2. ファイルを100MBずつに分け、同じアップロードIDで 0,1,2… の順に upload_chunk.php へ送る
+  3. 最後の分の応答に URL / filename / delkey が入る
+  4. パスワードは set_dlkey.php で後から設定（半角英数1〜4文字）
+  5. 送ったファイルのサイズをダウンロード側から確認
+途中で切れたら同じ分を送り直し、アプリを閉じても続きの分から再開する。
+"""
+import json
+import os
+import re
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import requests
+
+import engine
+
+TOP_URL = "https://gigafile.nu/"
+UP_CHUNK = 100 * 1024 * 1024        # 公式と同じ100MB
+LIFETIMES = (3, 5, 7, 14, 30, 60, 100)
+MAX_RETRIES = 30
+DLKEY_RE = re.compile(r"^[0-9A-Za-z]{1,4}$")
+
+QUEUED, RUNNING, PAUSED, DONE, ERROR, RETRYING = (
+    engine.QUEUED, engine.RUNNING, engine.PAUSED, engine.DONE, engine.ERROR, engine.RETRYING)
+VERIFYING = "確認中"
+
+
+class UploadError(Exception):
+    pass
+
+
+class Stopped(Exception):
+    pass
+
+
+def valid_dlkey(k: str) -> bool:
+    return not k or bool(DLKEY_RE.match(k))
+
+
+def get_server(session) -> str:
+    r = session.get(TOP_URL, timeout=30)
+    r.raise_for_status()
+    m = re.search(r'var\s+server\s*=\s*"([^"]+)"', r.text)
+    if not m:
+        raise UploadError("ギガファイル便の送信先を取得できませんでした（ページ構成の変更の可能性）")
+    return m[1]
+
+
+class ChunkBody:
+    """multipart/form-data をファイルから少しずつ読みながら送る（メモリを食わない）"""
+
+    def __init__(self, fields, path, start, length, on_read, stop_event):
+        self.boundary = "----GigaDL" + uuid.uuid4().hex
+        b = self.boundary
+        head = b""
+        for k, v in fields[:-1]:
+            head += (f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").encode()
+        head += (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"blob\"\r\n"
+                 f"Content-Type: application/octet-stream\r\n\r\n").encode()
+        k, v = fields[-1]
+        tail = (f"\r\n--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                f"--{b}--\r\n").encode()
+        self.head, self.tail = head, tail
+        self.f = open(path, "rb")
+        self.f.seek(start)
+        self.remaining = length
+        self.length = len(head) + length + len(tail)
+        self.on_read = on_read
+        self.stop = stop_event
+        self.stage = 0
+
+    @property
+    def content_type(self):
+        return f"multipart/form-data; boundary={self.boundary}"
+
+    def __len__(self):
+        return self.length
+
+    def read(self, n=-1):
+        if self.stop.is_set():
+            raise Stopped()
+        if self.stage == 0:
+            self.stage = 1
+            return self.head
+        if self.stage == 1:
+            if self.remaining > 0:
+                size = min(1024 * 1024 if n is None or n < 0 else max(n, 64 * 1024), self.remaining)
+                data = self.f.read(size)
+                if not data:
+                    raise UploadError("ファイルを読み込めませんでした（途中で変更・削除された可能性）")
+                self.remaining -= len(data)
+                self.on_read(len(data))
+                return data
+            self.stage = 2
+            return self.tail
+        if self.stage == 2:
+            self.stage = 3
+            self.f.close()
+            return b""
+        return b""
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
+class UploadTask:
+    FIELDS = ("id", "path", "name", "size", "mtime", "lifetime", "dlkey", "status",
+              "message", "upload_id", "server", "cookies", "next_chunk", "chunk_size",
+              "url", "srv_filename", "delkey", "added_at", "finished_at", "restarted")
+
+    def __init__(self, path, lifetime=7, dlkey=""):
+        p = Path(path)
+        st = p.stat()
+        self.id = uuid.uuid4().hex
+        self.path = str(p)
+        self.name = p.name
+        self.size = st.st_size
+        self.mtime = st.st_mtime
+        self.lifetime = int(lifetime)
+        self.dlkey = dlkey or ""
+        self.status = QUEUED
+        self.message = ""
+        self.upload_id = ""
+        self.server = ""
+        self.cookies = {}
+        self.next_chunk = 0
+        self.chunk_size = UP_CHUNK
+        self.url = ""
+        self.srv_filename = ""
+        self.delkey = ""
+        self.added_at = time.time()
+        self.finished_at = 0
+        self.restarted = False
+        self._init_runtime()
+
+    def _init_runtime(self):
+        self.sent = self.next_chunk * self.chunk_size if self.chunk_size else 0
+        self.sent = min(self.sent, self.size)
+        self.speed = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+
+    @property
+    def chunks(self):
+        return max(1, -(-self.size // self.chunk_size))
+
+    def to_dict(self):
+        return {k: getattr(self, k) for k in self.FIELDS}
+
+    @classmethod
+    def from_dict(cls, d):
+        t = cls.__new__(cls)
+        for k in cls.FIELDS:
+            setattr(t, k, d.get(k))
+        t.cookies = t.cookies or {}
+        t.chunk_size = t.chunk_size or UP_CHUNK
+        t.next_chunk = t.next_chunk or 0
+        t.dlkey = t.dlkey or ""
+        t.message = t.message or ""
+        t._init_runtime()
+        if t.status in (RUNNING, RETRYING, VERIFYING):
+            t.status = PAUSED
+        if t.status == DONE:
+            t.sent = t.size
+        return t
+
+
+class UploadManager:
+    """
+    listener(event, task): "up_added" | "up_update" | "up_done" | "up_error" | "up_all_done"
+    """
+
+    def __init__(self, state_path, listener=None, max_parallel=1):
+        self.state_path = Path(state_path)
+        self.listener = listener or (lambda e, t: None)
+        self.max_parallel = max_parallel
+        self.tasks: list[UploadTask] = []
+        self.lock = threading.RLock()
+        self.settings = {"lifetime": 7, "auto_resume": True}
+        self._had_activity = False
+        self._load()
+
+    # --- 永続化
+    def _load(self):
+        try:
+            d = json.loads(self.state_path.read_text("utf-8"))
+            self.settings.update(d.get("settings", {}))
+            self.tasks = [UploadTask.from_dict(x) for x in d.get("tasks", [])]
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    def save(self):
+        with self.lock:
+            d = {"settings": self.settings, "tasks": [t.to_dict() for t in self.tasks]}
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_name(f".{self.state_path.name}.{uuid.uuid4().hex}.tmp")
+            tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
+            os.replace(tmp, self.state_path)
+
+    def startup(self):
+        if self.settings.get("auto_resume", True):
+            with self.lock:
+                for t in self.tasks:
+                    if t.status == PAUSED:
+                        t.status = QUEUED
+            self._schedule()
+
+    # --- 追加
+    @staticmethod
+    def expand(paths):
+        """ファイル/フォルダのリストを、送るファイルの一覧に展開（隠しファイルは除く）"""
+        out = []
+        for p in paths:
+            p = Path(p)
+            if p.is_dir():
+                for root, dirs, files in os.walk(p):
+                    dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                    for f in sorted(files):
+                        if not f.startswith(".") and f not in ("Thumbs.db", "desktop.ini"):
+                            out.append(Path(root) / f)
+            elif p.is_file() and not p.name.startswith("."):
+                out.append(p)
+        return out
+
+    def add_files(self, paths, lifetime, dlkey=""):
+        if not valid_dlkey(dlkey):
+            raise UploadError("パスワードは半角英数1〜4文字です")
+        added = []
+        with self.lock:
+            for p in self.expand(paths):
+                try:
+                    if p.stat().st_size == 0:
+                        continue
+                except OSError:
+                    continue
+                t = UploadTask(p, lifetime, dlkey)
+                self.tasks.append(t)
+                added.append(t)
+                self.listener("up_added", t)
+        self.save()
+        self._schedule()
+        return added
+
+    # --- 操作
+    def pause(self, t):
+        with self.lock:
+            if t.status in (RUNNING, RETRYING):
+                t._stop.set()
+            elif t.status == QUEUED:
+                t.status = PAUSED
+                self.listener("up_update", t)
+        self.save()
+
+    def resume(self, t):
+        with self.lock:
+            if t.status in (PAUSED, ERROR):
+                t.status = QUEUED
+                t.message = ""
+                self.listener("up_update", t)
+        self.save()
+        self._schedule()
+
+    def set_dlkey(self, t, key):
+        """完了前なら予約、完了後ならその場で設定（別スレッド）"""
+        if not valid_dlkey(key):
+            raise UploadError("パスワードは半角英数1〜4文字です")
+        t.dlkey = key
+        self.save()
+        if t.status == DONE and key:
+            def work():
+                try:
+                    self._apply_dlkey(t, requests_session_for(t))
+                    t.message = "パスワードを設定しました"
+                except Exception as ex:
+                    t.message = f"パスワードを設定できませんでした: {ex}"
+                self.save()
+                self.listener("up_update", t)
+            threading.Thread(target=work, daemon=True).start()
+
+    def remove(self, t):
+        if t.status in (RUNNING, RETRYING, VERIFYING):
+            t._stop.set()
+            if t._thread:
+                t._thread.join(timeout=15)
+        with self.lock:
+            if t in self.tasks:
+                self.tasks.remove(t)
+        self.save()
+        self._schedule()
+
+    def clear_done(self):
+        with self.lock:
+            self.tasks = [t for t in self.tasks if t.status != DONE]
+        self.save()
+
+    def pause_all(self):
+        for t in list(self.tasks):
+            if t.status in (RUNNING, RETRYING, QUEUED):
+                self.pause(t)
+
+    def resume_all(self):
+        for t in list(self.tasks):
+            if t.status in (PAUSED, ERROR):
+                self.resume(t)
+
+    def shutdown(self):
+        with self.lock:
+            running = [t for t in self.tasks if t.status in (RUNNING, RETRYING, VERIFYING)]
+            for t in running:
+                t._stop.set()
+        for t in running:
+            if t._thread:
+                t._thread.join(timeout=15)
+        self.save()
+
+    def busy(self):
+        return any(t.status in (RUNNING, RETRYING, QUEUED, VERIFYING) for t in self.tasks)
+
+    # --- スケジューラ
+    def _schedule(self):
+        with self.lock:
+            active = sum(1 for t in self.tasks if t.status in (RUNNING, RETRYING, VERIFYING))
+            for t in self.tasks:
+                if active >= self.max_parallel:
+                    break
+                if t.status == QUEUED:
+                    t.status = RUNNING
+                    t._stop.clear()
+                    t._thread = threading.Thread(target=self._run, args=(t,), daemon=True)
+                    t._thread.start()
+                    active += 1
+                    self._had_activity = True
+            busy = self.busy()
+        if not busy and self._had_activity:
+            self._had_activity = False
+            self.listener("up_all_done", None)
+
+    def _run(self, t: UploadTask):
+        self.listener("up_update", t)
+        retries = 0
+        while True:
+            try:
+                self._upload(t)
+                break
+            except Stopped:
+                break
+            except UploadError as ex:
+                t.status, t.message = ERROR, str(ex)
+                break
+            except (requests.exceptions.RequestException, OSError, ValueError) as ex:
+                if t._stop.is_set():
+                    break
+                retries += 1
+                if retries > MAX_RETRIES:
+                    t.status, t.message = ERROR, f"接続エラーが続いたため中止: {ex}"
+                    break
+                wait = min(30, 2 ** min(retries, 5))
+                t.status = RETRYING
+                t.message = f"{retries}回目の再送まで{wait}秒"
+                t.speed = 0
+                self.save()
+                self.listener("up_update", t)
+                if t._stop.wait(wait):
+                    break
+                t.status, t.message = RUNNING, ""
+        if t._stop.is_set() and t.status in (RUNNING, RETRYING, VERIFYING):
+            t.status, t.message = PAUSED, ""
+        t.speed = 0
+        self.save()
+        if t.status == DONE:
+            self.listener("up_done", t)
+        elif t.status == ERROR:
+            self.listener("up_error", t)
+        else:
+            self.listener("up_update", t)
+        self._schedule()
+
+    # --- 本体
+    def _check_file(self, t):
+        p = Path(t.path)
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            raise UploadError("元のファイルが見つかりません（移動・削除された可能性）")
+        if st.st_size != t.size or abs(st.st_mtime - t.mtime) > 2:
+            raise UploadError("送信中に元のファイルが変更されました。一覧から削除して追加し直してください")
+
+    def _start_fresh(self, t, session):
+        t.upload_id = uuid.uuid4().hex
+        t.server = get_server(session)
+        t.next_chunk = 0
+        t.sent = 0
+        t.cookies = {}
+
+    def _upload(self, t: UploadTask):
+        self._check_file(t)
+        session = engine.new_session()
+        if t.upload_id and t.next_chunk > 0:
+            for k, v in (t.cookies or {}).items():
+                session.cookies.set(k, v)
+        else:
+            self._start_fresh(t, session)
+        self.save()
+
+        while t.next_chunk < t.chunks:
+            if t._stop.is_set():
+                raise Stopped()
+            idx = t.next_chunk
+            start = idx * t.chunk_size
+            length = min(t.chunk_size, t.size - start)
+            t.sent = start
+            last_emit = [time.monotonic()]
+            window = [time.monotonic(), start]
+
+            def on_read(n):
+                t.sent += n
+                now = time.monotonic()
+                if now - last_emit[0] >= 0.3:
+                    dt = max(now - window[0], 1e-6)
+                    inst = (t.sent - window[1]) / dt
+                    t.speed = inst if not t.speed else t.speed * 0.7 + inst * 0.3
+                    window[0], window[1] = now, t.sent
+                    last_emit[0] = now
+                    self.listener("up_update", t)
+
+            fields = [("id", t.upload_id), ("name", t.name), ("chunk", str(idx)),
+                      ("chunks", str(t.chunks)), ("lifetime", str(t.lifetime))]
+            body = ChunkBody(fields, t.path, start, length, on_read, t._stop)
+            try:
+                r = session.post(f"https://{t.server}/upload_chunk.php", data=body,
+                                 headers={"Content-Type": body.content_type,
+                                          "Content-Length": str(len(body)),
+                                          "Origin": "https://gigafile.nu",
+                                          "Referer": TOP_URL},
+                                 timeout=(30, 1800))
+            except requests.exceptions.RequestException as ex:
+                if t._stop.is_set() or isinstance(ex.__context__, Stopped) or "Stopped" in repr(ex):
+                    t.sent = start
+                    raise Stopped()
+                t.sent = start
+                raise
+            finally:
+                body.close()
+            # 送り終わって返事が来た分は、一時停止が押されていても必ず記録する
+            # （捨てると再開時に同じ分を送り直し、順番違いで最初からになってしまう）
+            r.raise_for_status()
+            try:
+                data = r.json()
+            except ValueError:
+                raise requests.exceptions.ContentDecodingError("サーバーの応答を読めませんでした")
+            if data.get("status") != 0:
+                # 再開した続きが受け付けられない → 一度だけ最初から送り直す
+                if idx > 0 and not t.restarted:
+                    t.restarted = True
+                    t.message = "続きを受け付けてもらえなかったため、最初から送り直します"
+                    self.listener("up_update", t)
+                    self._start_fresh(t, session)
+                    self.save()
+                    continue
+                raise UploadError(f"ギガファイル便がエラーを返しました: {data.get('message') or data}")
+            t.cookies = requests.utils.dict_from_cookiejar(session.cookies)
+            t.next_chunk = idx + 1
+            t.sent = start + length
+            self.save()
+            self.listener("up_update", t)
+            if t.next_chunk >= t.chunks:
+                if not data.get("url"):
+                    raise UploadError("送信は終わりましたがURLが返ってきませんでした")
+                t.url = data["url"]
+                t.srv_filename = data.get("filename", "")
+                t.delkey = data.get("delkey", "")
+                self.save()
+
+        # --- 仕上げ：パスワード設定 → サイズ確認
+        if t._stop.is_set():
+            raise Stopped()
+        t.status = VERIFYING
+        t.message = ""
+        self.listener("up_update", t)
+        if t.dlkey:
+            self._apply_dlkey(t, session)
+        self._verify(t, session)
+        t.status = DONE
+        t.finished_at = time.time()
+        t.sent = t.size
+        t.message = ""
+
+    def _apply_dlkey(self, t, session):
+        if not (t.srv_filename and t.delkey):
+            raise UploadError("パスワード設定に必要な情報がありません")
+        server = t.server or get_server(session)
+        r = session.get(f"https://{server}/set_dlkey.php",
+                        params={"file": t.srv_filename, "delkey": t.delkey, "dlkey": t.dlkey},
+                        timeout=30)
+        r.raise_for_status()
+        if r.json().get("status") != 0:
+            raise UploadError("パスワードを設定できませんでした")
+
+    def _verify(self, t, session):
+        files = engine.parse_page(t.url, session)
+        fid = files[0][2]
+        base = engine.normalize_url(t.url).rsplit("/", 1)[0]
+        url = f"{base}/download.php?file={fid}"
+        if t.dlkey:
+            url += f"&dlkey={t.dlkey}"
+        with session.get(url, stream=True, timeout=60, headers={"Referer": t.url}) as r:
+            r.raise_for_status()
+            if "text/html" in r.headers.get("Content-Type", "").lower():
+                raise UploadError("確認用のダウンロードができませんでした（パスワード設定を確認してください）")
+            n = int(r.headers.get("Content-Length") or 0)
+        if n != t.size:
+            raise UploadError(f"ギガファイル便側のサイズが一致しません（元 {t.size} / 先 {n}）。もう一度送り直してください")
+
+
+def requests_session_for(t):
+    s = engine.new_session()
+    for k, v in (t.cookies or {}).items():
+        s.cookies.set(k, v)
+    return s
+
+
+def share_text(tasks):
+    """相手に送る用の文面"""
+    lines = []
+    for t in tasks:
+        lines.append(f"{t.name}（{engine.human(t.size)}）")
+        lines.append(t.url)
+        if t.dlkey:
+            lines.append(f"パスワード: {t.dlkey}")
+        lines.append("")
+    if tasks:
+        days = max(t.lifetime for t in tasks)
+        lines.append(f"※ダウンロード期限：アップロードから{days}日")
+    return "\n".join(lines).strip()

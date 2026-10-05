@@ -1,5 +1,5 @@
 """
-GigaDL — ギガファイル便ダウンローダー（Mac / Windows）
+GigaDL — ギガファイル便ダウンローダー / アップローダー（Mac / Windows）
 パスワード付きリンク / レジューム / 自動再接続 / 完了通知
 """
 import sys
@@ -11,16 +11,19 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
-    QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QSystemTrayIcon, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import engine
 import platform_util as pu
+import uploader
+from upload_ui import UploadTab
 from engine import DONE, ERROR, MOVING, PAUSED, QUEUED, RETRYING, RUNNING, human
 from platform_util import notify, reveal
 
 APP_NAME = pu.APP_NAME
 STATE = pu.data_dir() / "state.json"
+UP_STATE = pu.data_dir() / "uploads.json"
 HERE = Path(__file__).resolve().parent
 COLS = ["ファイル名", "サイズ", "進捗", "速度", "残り", "状態", "保存先"]
 MAX_RECENT = 10
@@ -56,7 +59,7 @@ class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(900, 560)
+        self.resize(980, 620)
         self.bridge = Bridge()
         self.bridge.event.connect(self.on_event)
         self.mgr = engine.Manager(STATE, lambda e, t: self.bridge.event.emit(e, t))
@@ -75,8 +78,11 @@ class Main(QMainWindow):
         self.bars = {}     # task.id -> QProgressBar
         self.batch_done = []
 
+        self.up = uploader.UploadManager(UP_STATE, lambda e, t: self.bridge.event.emit(e, t))
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
         root = QWidget()
-        self.setCentralWidget(root)
+        self.tabs.addTab(root, "ダウンロード")
         v = QVBoxLayout(root)
 
         # --- 入力
@@ -167,6 +173,13 @@ class Main(QMainWindow):
 
         self.status = QLabel()
         self.statusBar().addWidget(self.status, 1)
+        self.up_tab = UploadTab(self.up, self.status)
+        self.tabs.addTab(self.up_tab, "アップロード")
+        try:
+            self.tabs.setCurrentIndex(int(self.mgr.settings.get("tab", 0)))
+        except Exception:
+            pass
+        self.tabs.currentChanged.connect(self._tab_changed)
 
         for t in self.mgr.tasks:
             self.add_row(t)
@@ -178,6 +191,7 @@ class Main(QMainWindow):
         self.timer.start(1000)
 
         QTimer.singleShot(300, self.mgr.startup)
+        QTimer.singleShot(350, self.up.startup)
         QTimer.singleShot(400, self.grab_clipboard)
 
     # ----------------------------------------------------- 入力系
@@ -187,6 +201,7 @@ class Main(QMainWindow):
             return
         text = QGuiApplication.clipboard().text() or ""
         known = {t.page_url for t in self.mgr.tasks}
+        known |= {engine.normalize_url(t.url) for t in self.up.tasks if t.url}   # 自分が送ったURLは除く
         found = [u for u in text.split() if engine.is_gigafile_url(u)
                  and engine.normalize_url(u) not in known]
         if found:
@@ -363,15 +378,32 @@ class Main(QMainWindow):
         self.b_remove.setEnabled(bool(s) and MOVING not in st)
         self.b_show.setEnabled(bool(s))
 
+    def _tab_changed(self, i):
+        self.mgr.settings["tab"] = i
+        self.mgr.save()
+        self.refresh_summary()
+
     def refresh_summary(self):
         ts = self.mgr.tasks
         active = [t for t in ts if t.status in (RUNNING, RETRYING)]
         waiting = sum(1 for t in ts if t.status == QUEUED)
         speed = sum(t.speed for t in active)
-        self.caff.set(bool(active or waiting))
+        us = self.up.tasks
+        u_active = [t for t in us if t.status in (uploader.RUNNING, uploader.RETRYING, uploader.VERIFYING)]
+        u_wait = sum(1 for t in us if t.status == uploader.QUEUED)
+        self.caff.set(bool(active or waiting or u_active or u_wait))
+        parts = []
         if active or waiting:
-            self.status.setText(f"ダウンロード中 {len(active)}件 / 待機 {waiting}件 — "
-                                f"合計 {human(speed)}/s（スリープ防止中）")
+            parts.append(f"ダウンロード {len(active)}件（待機 {waiting}）{human(speed)}/s")
+        if u_active or u_wait:
+            parts.append(f"アップロード {len(u_active)}件（待機 {u_wait}）"
+                         f"{human(sum(t.speed for t in u_active))}/s")
+        if parts:
+            self.status.setText(" ／ ".join(parts) + "　— スリープ防止中")
+        elif self.tabs.currentIndex() == 1:
+            done = sum(1 for t in us if t.status == uploader.DONE)
+            self.status.setText(f"アップロード {done}/{len(us)}件 完了" if us else
+                                "ファイルをドラッグ＆ドロップしてアップロード")
         elif ts:
             self.status.setText(f"{sum(1 for t in ts if t.status == DONE)}/{len(ts)}件 完了")
         else:
@@ -379,6 +411,9 @@ class Main(QMainWindow):
 
     # ----------------------------------------------------- エンジンからのイベント
     def on_event(self, ev, t):
+        if ev.startswith("up_"):
+            self.up_tab.on_event(ev, t)
+            return
         if ev == "added":
             self.add_row(t)
             self.status.setText(f"追加: {t.name}")
@@ -476,16 +511,19 @@ class Main(QMainWindow):
 
     def closeEvent(self, e):
         active = [t for t in self.mgr.tasks if t.status in (RUNNING, RETRYING, QUEUED)]
-        if active:
+        up_active = [t for t in self.up.tasks if t.status in
+                     (uploader.RUNNING, uploader.RETRYING, uploader.QUEUED, uploader.VERIFYING)]
+        if active or up_active:
             r = QMessageBox.question(
                 self, APP_NAME,
-                f"{len(active)}件がダウンロード中/待機中です。終了しますか？\n"
-                "（途中までのデータは残り、次回起動時に続きから再開できます）",
+                f"ダウンロード{len(active)}件・アップロード{len(up_active)}件が途中です。終了しますか？\n"
+                "（次回起動時に続きから再開できます）",
                 QMessageBox.Ok | QMessageBox.Cancel)
             if r != QMessageBox.Ok:
                 e.ignore()
                 return
         self.mgr.shutdown()
+        self.up.shutdown()
         self.caff.set(False)
         if self.tray:
             self.tray.hide()

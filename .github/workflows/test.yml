@@ -33,6 +33,8 @@ jobs:
           $checks = @(
             "$env:LOCALAPPDATA\GigaDL\venv\Scripts\pythonw.exe",
             "$env:LOCALAPPDATA\GigaDL\app\gigadl.py",
+            "$env:LOCALAPPDATA\GigaDL\app\uploader.py",
+            "$env:LOCALAPPDATA\GigaDL\app\upload_ui.py",
             "$env:LOCALAPPDATA\GigaDL\app\GigaDL.ico",
             (Join-Path ([Environment]::GetFolderPath('Programs')) 'GigaDL.lnk'),
             (Join-Path ([Environment]::GetFolderPath('Desktop'))  'GigaDL.lnk')
@@ -51,6 +53,11 @@ jobs:
       - name: ダウンロード機能のテスト
         shell: pwsh
         run: '& "$env:LOCALAPPDATA\GigaDL\venv\Scripts\python.exe" tests\run.py tests\test_engine.py'
+
+      - name: アップロード機能のテスト
+        if: success() || failure()
+        shell: pwsh
+        run: '& "$env:LOCALAPPDATA\GigaDL\venv\Scripts\python.exe" tests\run.py tests\test_upload.py'
 
       - name: 画面のテスト
         if: success() || failure()
@@ -75,8 +82,12 @@ jobs:
         run: |
           test -d /Applications/GigaDL.app || test -d ~/Applications/GigaDL.app
           ls "$HOME/Library/Application Support/GigaDL/app"
+          test -f "$HOME/Library/Application Support/GigaDL/app/uploader.py"
       - name: ダウンロード機能のテスト
         run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/run.py tests/test_engine.py'
+      - name: アップロード機能のテスト
+        if: success() || failure()
+        run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/run.py tests/test_upload.py'
       - name: 画面のテスト
         if: success() || failure()
         run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/run.py tests/test_gui.py'
