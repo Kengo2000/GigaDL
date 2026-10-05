@@ -1,0 +1,85 @@
+name: GigaDL test
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-11-arm' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PCの情報
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          "$($os.Caption) build $($os.BuildNumber) / $env:PROCESSOR_ARCHITECTURE"
+
+      - name: install.bat を実行（本番と同じ手順）
+        shell: cmd
+        run: echo.| install.bat
+
+      - name: インストール結果を確認
+        shell: pwsh
+        run: |
+          $ok = $true
+          $checks = @(
+            "$env:LOCALAPPDATA\GigaDL\venv\Scripts\pythonw.exe",
+            "$env:LOCALAPPDATA\GigaDL\app\gigadl.py",
+            "$env:LOCALAPPDATA\GigaDL\app\GigaDL.ico",
+            (Join-Path ([Environment]::GetFolderPath('Programs')) 'GigaDL.lnk'),
+            (Join-Path ([Environment]::GetFolderPath('Desktop'))  'GigaDL.lnk')
+          )
+          foreach ($p in $checks) {
+            if (Test-Path $p) { "OK  $p" } else { "NG  $p"; $ok = $false }
+          }
+          Start-Sleep 5
+          $running = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Where-Object { $_.CommandLine -match 'gigadl.py' }
+          if ($running) { "OK  インストール後にアプリが起動した" } else { "NG  アプリが起動していない"; $ok = $false }
+          $running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+          $log = "$env:APPDATA\GigaDL\gigadl.log"
+          if (Test-Path $log) { "---- gigadl.log ----"; Get-Content $log }
+          if (-not $ok) { exit 1 }
+
+      - name: ダウンロード機能のテスト
+        shell: pwsh
+        run: '& "$env:LOCALAPPDATA\GigaDL\venv\Scripts\python.exe" tests\test_engine.py'
+
+      - name: 画面のテスト
+        shell: pwsh
+        run: '& "$env:LOCALAPPDATA\GigaDL\venv\Scripts\python.exe" tests\test_gui.py'
+
+      - name: スクリーンショットを保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ matrix.os }}
+          path: tests/out/
+
+  mac:
+    name: Mac
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.command を実行
+        run: bash install.command
+      - name: インストール結果を確認
+        run: |
+          test -d /Applications/GigaDL.app || test -d ~/Applications/GigaDL.app
+          ls "$HOME/Library/Application Support/GigaDL/app"
+      - name: ダウンロード機能のテスト
+        run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/test_engine.py'
+      - name: 画面のテスト
+        run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/test_gui.py'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-mac
+          path: tests/out/
