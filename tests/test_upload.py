@@ -120,6 +120,9 @@ class H(BaseHTTPRequestHandler):
                         self.connection.shutdown(2)
                         return
             time.sleep(0.002)
+        if len(body) < n:          # 途中で切れた送信は受け付けない（本物のサーバーと同じ）
+            self.close_connection = True
+            return
         f = parse_multipart(body, ctype)
         uid, idx, total = f["id"].decode(), int(f["chunk"]), int(f["chunks"])
         with LOCK:
@@ -295,8 +298,11 @@ try:
     check(end == b"" and got.endswith(b"--\r\n"), "送り終えた後の一時停止で送信を壊さない")
 except uploader.Stopped:
     check(False, "送り終えた後の一時停止で送信を壊さない")
-cb2 = uploader.ChunkBody([("id", "a"), ("lifetime", "7")], bf, 0, 1000, lambda n: None, ev)
+ev.clear()
+cb2 = uploader.ChunkBody([("id", "a"), ("lifetime", "7")], bf, 0, 3000, lambda n: None, ev)
+bf.write_bytes(b"x" * 3000)
 cb2.read()
+ev.set()
 try:
     cb2.read()
     check(False, "送っている途中なら一時停止できる")
