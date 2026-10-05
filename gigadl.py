@@ -5,7 +5,10 @@ GigaDL — ギガファイル便ダウンローダー / アップローダー（
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+import getpass
+
+from PySide6.QtCore import QEvent, QLockFile, QObject, Qt, QTimer, Signal
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QBrush, QColor, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
@@ -530,6 +533,29 @@ class Main(QMainWindow):
         e.accept()
 
 
+SOCK_NAME = "GigaDL-" + "".join(c for c in getpass.getuser() if c.isalnum())
+
+
+def acquire_single_instance():
+    """GigaDLが2つ同時に動くと同じファイルを取り合うので、1つだけにする。
+    すでに動いていれば、そのウィンドウを前に出すよう頼んで True を返す。"""
+    lock = QLockFile(str(pu.data_dir() / "gigadl.lock"))
+    lock.setStaleLockTime(0)          # 期限切れ扱いにはせず、持ち主のプロセスが消えたときだけ解除
+    if lock.tryLock(300):
+        return lock, False
+    sock = QLocalSocket()
+    sock.connectToServer(SOCK_NAME)
+    if sock.waitForConnected(1500):
+        sock.write(b"show")
+        sock.flush()
+        sock.waitForBytesWritten(1000)
+        sock.disconnectFromServer()
+        return None, True
+    if lock.removeStaleLockFile() and lock.tryLock(300):   # 前回が異常終了していた場合
+        return lock, False
+    return None, True
+
+
 def main():
     # エラーをログに残す（Windowsのpythonwは画面出力が無いため）
     if sys.stderr is None or pu.IS_WIN:
@@ -547,9 +573,29 @@ def main():
         except Exception:
             pass
     app.setWindowIcon(app_icon())
+    lock, running = acquire_single_instance()
+    if running:
+        return            # すでに動いているGigaDLを前に出した
+    app._gigadl_lock = lock
     w = Main()
+    server = QLocalServer()
+    QLocalServer.removeServer(SOCK_NAME)
+    server.listen(SOCK_NAME)
+
+    def bring_front():
+        c = server.nextPendingConnection()
+        if c:
+            c.readyRead.connect(lambda: None)
+        w.showNormal()
+        w.raise_()
+        w.activateWindow()
+    server.newConnection.connect(bring_front)
+    app._gigadl_server = server
     w.show()
-    sys.exit(app.exec())
+    rc = app.exec()
+    server.close()
+    lock.unlock()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

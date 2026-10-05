@@ -64,6 +64,11 @@ jobs:
         shell: pwsh
         run: '& "$env:LOCALAPPDATA\GigaDL\venv\Scripts\python.exe" tests\run.py tests\test_gui.py'
 
+      - name: 二重起動しないことのテスト
+        if: success() || failure()
+        shell: pwsh
+        run: '& "$env:LOCALAPPDATA\GigaDL\venv\Scripts\python.exe" tests\run.py tests\test_single.py'
+
       - name: スクリーンショットを保存
         if: always()
         uses: actions/upload-artifact@v5
@@ -91,6 +96,9 @@ jobs:
       - name: 画面のテスト
         if: success() || failure()
         run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/run.py tests/test_gui.py'
+      - name: 二重起動しないことのテスト
+        if: success() || failure()
+        run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/run.py tests/test_single.py'
       - uses: actions/upload-artifact@v5
         if: always()
         with:
