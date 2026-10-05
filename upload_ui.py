@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import QRegularExpression, Qt, QUrl
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QGuiApplication, QRegularExpressionValidator
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -15,6 +15,31 @@ from engine import human
 from uploader import DONE, ERROR, PAUSED, QUEUED, RETRYING, RUNNING, VERIFYING
 
 COLS = ["ファイル名", "サイズ", "進捗", "速度", "残り", "状態", "URL"]
+GCOLS = ["まとめの名前", "ファイル数", "合計", "状態", "まとめURL"]
+
+
+class GroupDialog(QDialog):
+    """まとめの名前とパスワードを聞く"""
+
+    def __init__(self, parent, count, total, name="", key="", key_required=False):
+        super().__init__(parent)
+        self.setWindowTitle("1つのURLにまとめる")
+        f = QFormLayout(self)
+        f.addRow(QLabel(f"{count}個のファイル（合計 {human(total)}）を、1つのダウンロードURLにまとめます。"))
+        self.name = QLineEdit(name)
+        self.name.setPlaceholderText("空欄ならギガファイル便が自動で付けます")
+        self.key = QLineEdit(key)
+        self.key.setMaxLength(4)
+        self.key.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9A-Za-z]{0,4}")))
+        self.key.setPlaceholderText("必須（英数1〜4文字）" if key_required else "なし（英数1〜4文字）")
+        f.addRow("まとめの名前:", self.name)
+        f.addRow("パスワード:", self.key)
+        if key_required:
+            f.addRow(QLabel("パスワード付きのファイルを含むので、まとめにもパスワードが必要です。"))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        f.addRow(bb)
 
 
 def fmt_eta(sec):
@@ -98,6 +123,12 @@ class UploadTab(QWidget):
         self.key.setFixedWidth(150)
         self.key.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9A-Za-z]{0,4}")))
         h.addWidget(self.key)
+        h.addSpacing(16)
+        self.matome = QCheckBox("まとめて1つのURLにする")
+        self.matome.setToolTip("複数のファイルを送るとき、全部送り終わったら1つのダウンロードURLにまとめます")
+        self.matome.setChecked(bool(self.mgr.settings.get("matome", False)))
+        self.matome.toggled.connect(lambda on: (self.mgr.settings.__setitem__("matome", on), self.mgr.save()))
+        h.addWidget(self.matome)
         h.addStretch(1)
         v.addLayout(h)
 
@@ -113,7 +144,7 @@ class UploadTab(QWidget):
         self.table.itemSelectionChanged.connect(self.update_buttons)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for c, w in ((1, 80), (2, 170), (3, 90), (4, 80), (5, 170), (6, 230)):
+        for c, w in ((1, 80), (2, 170), (3, 90), (4, 80), (5, 200), (6, 230)):
             hh.setSectionResizeMode(c, QHeaderView.Interactive)
             self.table.setColumnWidth(c, w)
         v.addWidget(self.table, 1)
@@ -127,11 +158,41 @@ class UploadTab(QWidget):
         self.b_pause = QPushButton("一時停止"); self.b_pause.clicked.connect(self.act_pause)
         self.b_resume = QPushButton("再開"); self.b_resume.clicked.connect(self.act_resume)
         self.b_key = QPushButton("パスワード設定…"); self.b_key.clicked.connect(self.act_key)
+        self.b_group = QPushButton("選んだファイルをまとめる…"); self.b_group.clicked.connect(self.act_group)
         self.b_remove = QPushButton("一覧から削除"); self.b_remove.clicked.connect(self.act_remove)
-        for b in (self.b_copy, self.b_share, self.b_open, self.b_pause, self.b_resume, self.b_key, self.b_remove):
+        for b in (self.b_copy, self.b_share, self.b_open, self.b_group, self.b_pause, self.b_resume, self.b_key, self.b_remove):
             h.addWidget(b)
         h.addStretch(1)
         b = QPushButton("完了を一覧から消す"); b.clicked.connect(self.clear_done); h.addWidget(b)
+        v.addLayout(h)
+
+        # --- まとめたURL
+        gl = QLabel("まとめたURL（複数ファイルを1つのURLで渡せます）")
+        f = gl.font(); f.setBold(True); gl.setFont(f)
+        v.addWidget(gl)
+        self.gtable = QTableWidget(0, len(GCOLS))
+        self.gtable.setHorizontalHeaderLabels(GCOLS)
+        self.gtable.verticalHeader().hide()
+        self.gtable.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.gtable.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.gtable.setMaximumHeight(130)
+        self.gtable.cellDoubleClicked.connect(lambda r, c: self.g_copy())
+        self.gtable.itemSelectionChanged.connect(self.update_buttons)
+        gh = self.gtable.horizontalHeader()
+        gh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for c, w_ in ((1, 70), (2, 90), (3, 220), (4, 300)):
+            gh.setSectionResizeMode(c, QHeaderView.Interactive)
+            self.gtable.setColumnWidth(c, w_)
+        v.addWidget(self.gtable)
+        h = QHBoxLayout()
+        self.g_b_copy = QPushButton("まとめURLをコピー"); self.g_b_copy.clicked.connect(self.g_copy)
+        self.g_b_share = QPushButton("まとめの送る文面をコピー"); self.g_b_share.clicked.connect(self.g_share)
+        self.g_b_open = QPushButton("ブラウザで開く"); self.g_b_open.clicked.connect(self.g_open)
+        self.g_b_retry = QPushButton("もう一度まとめる"); self.g_b_retry.clicked.connect(self.g_retry)
+        self.g_b_remove = QPushButton("一覧から削除"); self.g_b_remove.clicked.connect(self.g_remove)
+        for b in (self.g_b_copy, self.g_b_share, self.g_b_open, self.g_b_retry, self.g_b_remove):
+            h.addWidget(b)
+        h.addStretch(1)
         v.addLayout(h)
 
         note = QLabel("送信は公式サイトと同じく100MBずつ順番に行います。途中で切れても切れた分だけ送り直し、"
@@ -142,6 +203,7 @@ class UploadTab(QWidget):
 
         for t in self.mgr.tasks:
             self.add_row(t)
+        self.rebuild_groups()
         self.update_buttons()
 
     # ------------------------------------------------- 追加
@@ -169,14 +231,23 @@ class UploadTab(QWidget):
             QMessageBox.information(self, pu.APP_NAME, "送れるファイルがありませんでした。")
             return
         total = sum(p.stat().st_size for p in files)
-        if len(files) > 1 or total > 20 * 1024 ** 3:
+        group, gname = False, ""
+        if self.matome.isChecked() and len(files) >= 2:
+            default = Path(paths[0]).name if len(paths) == 1 and Path(paths[0]).is_dir() else ""
+            dlg = GroupDialog(self, len(files), total, default, key)
+            dlg.key.setReadOnly(True)
+            dlg.key.setToolTip("上の「パスワード」欄と同じになります")
+            if dlg.exec() != QDialog.Accepted:
+                return
+            group, gname = True, dlg.name.text().strip()
+        elif len(files) > 1 or total > 20 * 1024 ** 3:
             msg = (f"{len(files)}個のファイル（合計 {human(total)}）をアップロードします。\n"
                    f"保持期限: {self.lifetime.currentData()}日　パスワード: {key or 'なし'}")
             if QMessageBox.question(self, pu.APP_NAME, msg,
                                     QMessageBox.Ok | QMessageBox.Cancel) != QMessageBox.Ok:
                 return
         try:
-            added = self.mgr.add_files(files, self.lifetime.currentData(), key)
+            added = self.mgr.add_files(files, self.lifetime.currentData(), key, group, gname)
         except uploader.UploadError as ex:
             QMessageBox.warning(self, pu.APP_NAME, str(ex))
             return
@@ -217,6 +288,9 @@ class UploadTab(QWidget):
             extra.append(t.message)
         if t.dlkey:
             extra.append(f"PW {t.dlkey}")
+        g = self.mgr.group_of(t)
+        if g:
+            extra.append(f"まとめ: {g.title}")
         st = t.status + (f"（{' / '.join(extra)}）" if extra else "")
         it = self.table.item(r, 5)
         it.setText(st)
@@ -233,7 +307,99 @@ class UploadTab(QWidget):
         self.bars.clear()
         for t in self.mgr.tasks:
             self.add_row(t)
+        self.rebuild_groups()
         self.update_buttons()
+
+    # ------------------------------------------------- まとめ一覧
+    def rebuild_groups(self):
+        self.gtable.setRowCount(0)
+        for g in self.mgr.groups:
+            self.update_group(g)
+
+    def _grow(self, g):
+        for r in range(self.gtable.rowCount()):
+            it = self.gtable.item(r, 0)
+            if it and it.data(Qt.UserRole) == g.id:
+                return r
+        return None
+
+    def update_group(self, g):
+        if g not in self.mgr.groups:
+            return
+        r = self._grow(g)
+        if r is None:
+            r = self.gtable.rowCount()
+            self.gtable.insertRow(r)
+            for c in range(len(GCOLS)):
+                self.gtable.setItem(r, c, QTableWidgetItem(""))
+            self.gtable.item(r, 0).setData(Qt.UserRole, g.id)
+        ms = self.mgr.members(g)
+        self.gtable.item(r, 0).setText(g.title)
+        self.gtable.item(r, 0).setToolTip("\n".join(t.name for t in ms))
+        self.gtable.item(r, 1).setText(str(len(g.member_ids)))
+        self.gtable.item(r, 2).setText(human(sum(t.size for t in ms)))
+        st = g.status + (f"（{g.message}）" if g.message else "") + (f"  PW {g.dlkey}" if g.dlkey else "")
+        it = self.gtable.item(r, 3)
+        it.setText(st)
+        it.setToolTip(st)
+        color = {DONE: "#2fa84f", ERROR: "#e5484d"}.get(g.status)
+        it.setForeground(QBrush(QColor(color)) if color else self.palette().text())
+        self.gtable.item(r, 4).setText(g.url)
+        self.gtable.item(r, 4).setToolTip(g.url)
+        for t in ms:
+            self.update_row(t)
+
+    def g_selected(self):
+        rows = sorted({i.row() for i in self.gtable.selectedIndexes()})
+        ids = [self.gtable.item(r, 0).data(Qt.UserRole) for r in rows if self.gtable.item(r, 0)]
+        return [g for g in self.mgr.groups if g.id in ids]
+
+    def g_copy(self):
+        gs = [g for g in self.g_selected() if g.status == DONE]
+        if gs:
+            QGuiApplication.clipboard().setText("\n".join(g.url for g in gs))
+            self.status.setText("まとめURLをコピーしました")
+
+    def g_share(self):
+        gs = [g for g in self.g_selected() if g.status == DONE]
+        if gs:
+            QGuiApplication.clipboard().setText(
+                "\n\n".join(uploader.share_text_group(g, self.mgr.members(g)) for g in gs))
+            self.status.setText("まとめの送る文面をコピーしました（ファイル一覧・URL・パスワード・期限入り）")
+
+    def g_open(self):
+        for g in [g for g in self.g_selected() if g.status == DONE][:3]:
+            QDesktopServices.openUrl(QUrl(g.url))
+
+    def g_retry(self):
+        for g in self.g_selected():
+            self.mgr.retry_group(g)
+
+    def g_remove(self):
+        gs = self.g_selected()
+        if gs and QMessageBox.question(
+                self, pu.APP_NAME, f"{len(gs)}件のまとめを一覧から削除します。\n"
+                "（ギガファイル便上のまとめURLと、各ファイルのURLはそのまま使えます）",
+                QMessageBox.Ok | QMessageBox.Cancel) == QMessageBox.Ok:
+            for g in gs:
+                self.mgr.remove_group(g)
+            self.rebuild()
+
+    def act_group(self):
+        s = [t for t in self.selected() if t.status != ERROR]
+        if len(s) < 2:
+            return
+        keyed = [t.dlkey for t in s if t.dlkey]
+        dlg = GroupDialog(self, len(s), sum(t.size for t in s), "", keyed[0] if keyed else "",
+                          key_required=bool(keyed))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            self.mgr.make_group(s, dlg.name.text().strip(), dlg.key.text().strip())
+        except uploader.UploadError as ex:
+            QMessageBox.warning(self, pu.APP_NAME, str(ex))
+            return
+        self.status.setText(f"{len(s)}個のファイルをまとめます（送信中のものは送り終わってから）")
 
     def task_by_id(self, tid):
         return next((t for t in self.mgr.tasks if t.id == tid), None)
@@ -258,6 +424,14 @@ class UploadTab(QWidget):
         self.b_pause.setEnabled(bool(st & {RUNNING, RETRYING, QUEUED}))
         self.b_resume.setEnabled(bool(st & {PAUSED, ERROR}))
         self.b_key.setEnabled(bool(s) and VERIFYING not in st)
+        self.b_group.setEnabled(len([t for t in s if t.status != ERROR]) >= 2)
+        gs = self.g_selected()
+        gdone = [g for g in gs if g.status == DONE]
+        self.g_b_copy.setEnabled(bool(gdone))
+        self.g_b_share.setEnabled(bool(gdone))
+        self.g_b_open.setEnabled(bool(gdone))
+        self.g_b_retry.setEnabled(any(g.status == ERROR for g in gs))
+        self.g_b_remove.setEnabled(bool(gs))
         self.b_remove.setEnabled(bool(s))
 
     # ------------------------------------------------- イベント
@@ -273,6 +447,14 @@ class UploadTab(QWidget):
         elif ev == "up_error":
             self.update_row(t)
             pu.notify("アップロードできませんでした", f"{t.name}: {t.message}", error=True)
+        elif ev == "up_group":
+            self.update_group(t)
+        elif ev == "up_group_done":
+            self.update_group(t)
+            pu.notify("まとめURLができました", f"{t.title}（{len(t.member_ids)}ファイル）\n{t.url}")
+        elif ev == "up_group_error":
+            self.update_group(t)
+            pu.notify("まとめURLを作れませんでした", t.message, error=True)
         elif ev == "up_all_done":
             if len(self.batch_done) > 1:
                 pu.notify("アップロードがすべて完了",
@@ -355,6 +537,7 @@ class UploadTab(QWidget):
                                ("一時停止", self.act_pause, self.b_pause),
                                ("再開", self.act_resume, self.b_resume),
                                ("パスワード設定…", self.act_key, self.b_key),
+                               ("選んだファイルをまとめる…", self.act_group, self.b_group),
                                ("一覧から削除", self.act_remove, self.b_remove)):
             a = m.addAction(label)
             a.setEnabled(btn.isEnabled())

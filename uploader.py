@@ -176,6 +176,50 @@ class UploadTask:
         return t
 
 
+GROUP_WAIT = "送信待ち"
+GROUP_MAKING = "まとめ中"
+BAD_NAME = re.compile(r'[\\/:,;*?"<>|]')
+
+
+class Group:
+    """複数ファイルを1つのURLにまとめたもの（ギガファイル便の「まとめてダウンロード」）"""
+    FIELDS = ("id", "name", "member_ids", "dlkey", "lifetime", "status", "message",
+              "url", "delkey", "file_name", "created", "verified")
+
+    def __init__(self, member_ids, name="", dlkey="", lifetime=7):
+        self.id = uuid.uuid4().hex
+        self.name = name or ""
+        self.member_ids = list(member_ids)
+        self.dlkey = dlkey or ""
+        self.lifetime = int(lifetime)
+        self.status = GROUP_WAIT
+        self.message = ""
+        self.url = ""
+        self.delkey = ""
+        self.file_name = ""
+        self.created = time.time()
+        self.verified = False
+
+    def to_dict(self):
+        return {k: getattr(self, k) for k in self.FIELDS}
+
+    @classmethod
+    def from_dict(cls, d):
+        g = cls.__new__(cls)
+        for k in cls.FIELDS:
+            setattr(g, k, d.get(k))
+        g.member_ids = g.member_ids or []
+        g.name, g.dlkey, g.message = g.name or "", g.dlkey or "", g.message or ""
+        g.url, g.delkey, g.file_name = g.url or "", g.delkey or "", g.file_name or ""
+        if g.status == GROUP_MAKING:
+            g.status = GROUP_WAIT
+        return g
+
+    @property
+    def title(self):
+        return self.file_name or self.name or "まとめ"
+
+
 class UploadManager:
     """
     listener(event, task): "up_added" | "up_update" | "up_done" | "up_error" | "up_all_done"
@@ -186,6 +230,7 @@ class UploadManager:
         self.listener = listener or (lambda e, t: None)
         self.max_parallel = max_parallel
         self.tasks: list[UploadTask] = []
+        self.groups: list[Group] = []
         self.lock = threading.RLock()
         self.settings = {"lifetime": 7, "auto_resume": True}
         self._had_activity = False
@@ -197,6 +242,7 @@ class UploadManager:
             d = json.loads(self.state_path.read_text("utf-8"))
             self.settings.update(d.get("settings", {}))
             self.tasks = [UploadTask.from_dict(x) for x in d.get("tasks", [])]
+            self.groups = [Group.from_dict(x) for x in d.get("groups", [])]
         except FileNotFoundError:
             pass
         except Exception:
@@ -204,7 +250,8 @@ class UploadManager:
 
     def save(self):
         with self.lock:
-            d = {"settings": self.settings, "tasks": [t.to_dict() for t in self.tasks]}
+            d = {"settings": self.settings, "tasks": [t.to_dict() for t in self.tasks],
+                 "groups": [g.to_dict() for g in self.groups]}
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_path.with_name(f".{self.state_path.name}.{uuid.uuid4().hex}.tmp")
             tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
@@ -217,6 +264,7 @@ class UploadManager:
                     if t.status == PAUSED:
                         t.status = QUEUED
             self._schedule()
+        self.check_groups()
 
     # --- 追加
     @staticmethod
@@ -235,9 +283,12 @@ class UploadManager:
                 out.append(p)
         return out
 
-    def add_files(self, paths, lifetime, dlkey=""):
+    def add_files(self, paths, lifetime, dlkey="", group=False, group_name=""):
+        """group=True なら、全部送り終わったら自動で1つのURLにまとめる"""
         if not valid_dlkey(dlkey):
             raise UploadError("パスワードは半角英数1〜4文字です")
+        if group_name and BAD_NAME.search(group_name):
+            raise UploadError('まとめの名前に次の文字は使えません: \\ / : , ; * ? " < > |')
         added = []
         with self.lock:
             for p in self.expand(paths):
@@ -250,9 +301,110 @@ class UploadManager:
                 self.tasks.append(t)
                 added.append(t)
                 self.listener("up_added", t)
+            if group and len(added) >= 2:
+                g = Group([t.id for t in added], group_name, dlkey, lifetime)
+                self.groups.append(g)
+                self.listener("up_group", g)
         self.save()
         self._schedule()
         return added
+
+    # --- まとめ
+    def members(self, g):
+        by_id = {t.id: t for t in self.tasks}
+        return [by_id[i] for i in g.member_ids if i in by_id]
+
+    def group_of(self, t):
+        return next((g for g in self.groups if t.id in g.member_ids), None)
+
+    def make_group(self, tasks, name="", dlkey=""):
+        """送信済み（または送信中）のファイルを選んで、後からまとめる"""
+        tasks = [t for t in tasks if t.status != ERROR]
+        if len(tasks) < 2:
+            raise UploadError("まとめるには2つ以上のファイルを選んでください")
+        if not valid_dlkey(dlkey):
+            raise UploadError("パスワードは半角英数1〜4文字です")
+        if name and BAD_NAME.search(name):
+            raise UploadError('まとめの名前に次の文字は使えません: \\ / : , ; * ? " < > |')
+        if any(t.dlkey for t in tasks) and not dlkey:
+            raise UploadError("パスワード付きのファイルが含まれているので、まとめにもパスワードが必要です（ギガファイル便の決まり）")
+        g = Group([t.id for t in tasks], name, dlkey, min(t.lifetime for t in tasks))
+        with self.lock:
+            self.groups.append(g)
+        self.listener("up_group", g)
+        self.save()
+        self.check_groups()
+        return g
+
+    def remove_group(self, g):
+        with self.lock:
+            if g in self.groups:
+                self.groups.remove(g)
+        self.save()
+
+    def retry_group(self, g):
+        if g.status == ERROR:
+            g.status, g.message = GROUP_WAIT, ""
+            self.save()
+            self.listener("up_group", g)
+            self.check_groups()
+
+    def check_groups(self):
+        """メンバーが全部送り終わったグループを、まとめURLにする"""
+        ready = []
+        with self.lock:
+            for g in self.groups:
+                if g.status != GROUP_WAIT:
+                    continue
+                ms = self.members(g)
+                if len(ms) < 2:
+                    g.status, g.message = ERROR, "まとめるファイルが2つ未満になりました"
+                    self.listener("up_group", g)
+                    continue
+                done = sum(1 for t in ms if t.status == DONE)
+                msg = f"{done}/{len(ms)} 送信済み"
+                if msg != g.message:
+                    g.message = msg
+                    self.listener("up_group", g)
+                if done == len(ms):
+                    g.status, g.message = GROUP_MAKING, ""
+                    ready.append(g)
+        for g in ready:
+            threading.Thread(target=self._make_matomete, args=(g,), daemon=True).start()
+
+    def _make_matomete(self, g):
+        self.listener("up_group", g)
+        ms = self.members(g)
+        try:
+            session = requests_session_for(ms[0])
+            server = ms[0].server or get_server(session)
+            data = {"urls[]": [t.url for t in ms], "dlkeys[]": [t.dlkey for t in ms],
+                    "file_name": g.name, "dlkey": g.dlkey, "lifetime": str(g.lifetime)}
+            r = session.post(f"https://{server}/matomete_get_url.php", data=data, timeout=60,
+                             headers={"Origin": "https://gigafile.nu", "Referer": TOP_URL,
+                                      "X-Requested-With": "XMLHttpRequest"})
+            r.raise_for_status()
+            js = r.json()
+            if js.get("status") != 0 or not js.get("url"):
+                raise UploadError("まとめURLの発行に失敗しました（ギガファイル便の応答: "
+                                  f"{js.get('message') or js.get('status')}）")
+            g.url, g.delkey = js["url"], js.get("delkey", "")
+            g.file_name = js.get("file_name", "") or g.name
+            g.message = ""
+            # 確認：まとめページに全ファイルが並んでいるか（確認が終わってから「完了」にする）
+            try:
+                files = engine.parse_page(g.url, session)
+                g.verified = len(files) == len(ms)
+                if not g.verified:
+                    g.message = f"まとめページのファイル数が {len(files)}/{len(ms)} です"
+            except Exception:
+                g.verified = False
+                g.message = "まとめページを確認できませんでした（URLは発行済み）"
+            g.status = DONE
+        except Exception as ex:
+            g.status, g.message = ERROR, str(ex) if isinstance(ex, UploadError) else f"まとめURLの発行に失敗しました: {ex}"
+        self.save()
+        self.listener("up_group_done" if g.status == DONE else "up_group_error", g)
 
     # --- 操作
     def pause(self, t):
@@ -300,10 +452,13 @@ class UploadManager:
                 self.tasks.remove(t)
         self.save()
         self._schedule()
+        self.check_groups()
 
     def clear_done(self):
         with self.lock:
-            self.tasks = [t for t in self.tasks if t.status != DONE]
+            # まだまとめ待ちのグループに入っているファイルは残す
+            keep = {i for g in self.groups if g.status in (GROUP_WAIT, GROUP_MAKING) for i in g.member_ids}
+            self.tasks = [t for t in self.tasks if t.status != DONE or t.id in keep]
         self.save()
 
     def pause_all(self):
@@ -382,6 +537,7 @@ class UploadManager:
         self.save()
         if t.status == DONE:
             self.listener("up_done", t)
+            self.check_groups()
         elif t.status == ERROR:
             self.listener("up_error", t)
         else:
@@ -530,6 +686,18 @@ def requests_session_for(t):
     for k, v in (t.cookies or {}).items():
         s.cookies.set(k, v)
     return s
+
+
+def share_text_group(g, members):
+    total = sum(t.size for t in members)
+    lines = [f"{g.title}（{len(members)}ファイル・合計 {engine.human(total)}）"]
+    lines += [f"・{t.name}" for t in members]
+    lines.append(g.url)
+    if g.dlkey:
+        lines.append(f"パスワード: {g.dlkey}")
+    lines.append("")
+    lines.append(f"※ダウンロード期限：アップロードから{g.lifetime}日")
+    return "\n".join(lines)
 
 
 def share_text(tasks):

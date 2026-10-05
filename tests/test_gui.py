@@ -48,6 +48,13 @@ class H(BaseHTTPRequestHandler):
         import re as _re
         n = int(self.headers["Content-Length"])
         body = self.rfile.read(n)
+        if self.path.startswith("/matomete_get_url.php"):
+            q = parse_qs(body.decode(), keep_blank_values=True)
+            pages = [u.rsplit("/", 1)[1] for u in q.get("urls[]", [])]
+            mid = f"9200-{len(UP.setdefault('matome', {}))}"
+            UP["matome"][mid] = {"pages": pages, "name": q.get("file_name", [""])[0], "dlkey": q.get("dlkey", [""])[0]}
+            out = {"status": 0, "url": f"https://53.gigafile.nu/{mid}", "delkey": "m", "file_name": UP["matome"][mid]["name"] or "gigafile-x"}
+            return self._send(200, "application/json", json.dumps(out).encode())
         b = _re.search(r"boundary=(.+)", self.headers["Content-Type"])[1].encode()
         f = {}
         for part in body.split(b"--" + b):
@@ -75,6 +82,12 @@ class H(BaseHTTPRequestHandler):
         pid = u.path.strip("/")
         if pid == "":
             return self._send(200, "text/html", b'<script>var server = "53.gigafile.nu";</script>')
+        if pid in UP.get("matome", {}):
+            items = "".join(
+                f'<div class="matomete_file"><div class="matomete_file_info"><span>x</span><span>{NAMES[pg]}</span>'
+                f'<span>（1 MB）</span></div><button class="download_panel_btn_dl" onclick="download({i}, \'{pg}\')"></button></div>'
+                for i, pg in enumerate(UP["matome"][pid]["pages"]))
+            return self._send(200, "text/html; charset=utf-8", f'<div id="contents_matomete">{items}</div>'.encode())
         if u.path == "/set_dlkey.php":
             UP["files"][q["file"][0]]["dlkey"] = q["dlkey"][0]
             return self._send(200, "application/json", b'{"status":0}')
@@ -255,6 +268,32 @@ check(ut.url in clip and "パスワード: x1" in clip and "14日" in clip, "送
 check(any(n[0] == "アップロード完了" for n in NOTES), "アップロード完了の通知")
 w.grab_clipboard()
 check(ut.url not in w.urls.toPlainText(), "自分のアップロードURLをダウンロード欄に入れない")
+
+# --- まとめて1つのURLにする
+import upload_ui  # noqa: E402
+from PySide6.QtWidgets import QDialog  # noqa: E402
+upload_ui.GroupDialog.exec = lambda self: (self.name.setText("案件A_素材"), QDialog.Accepted)[1]
+w.up_tab.matome.setChecked(True)
+w.up_tab.key.setText("")
+mfiles = []
+for nm in ("cam1.mov", "cam2.mov"):
+    pth = TMP / nm
+    pth.write_bytes(os.urandom(2 * 1024 * 1024 + 1))
+    mfiles.append(str(pth))
+w.up_tab.add_paths(mfiles)
+check(wait_for(lambda: len(w.up.groups) == 1, 5), "まとめを作成")
+g = w.up.groups[0]
+check(wait_for(lambda: g.status == uploader.DONE, 60), f"全部送ったら1つのURLにまとまる {g.message}")
+pump(0.5)
+shot("7_まとめURL")
+mt = UP["matome"].get(g.url.rsplit("/", 1)[1], {})
+check(len(mt.get("pages", [])) == 2 and mt.get("name") == "案件A_素材", "2ファイルを指定の名前でまとめる")
+check(w.up_tab.gtable.rowCount() == 1 and w.up_tab.gtable.item(0, 4).text() == g.url, "まとめたURLの一覧に表示")
+w.up_tab.gtable.selectRow(0)
+w.up_tab.g_share()
+clip = QApplication.clipboard().text()
+check(g.url in clip and "cam1.mov" in clip and "cam2.mov" in clip, "まとめの送る文面をコピー")
+check(any(n[0] == "まとめURLができました" for n in NOTES), "まとめ完了の通知")
 
 # --- 終了（確認ダイアログが出ない状態で閉じられる）
 w.close()

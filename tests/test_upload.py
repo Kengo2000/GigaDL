@@ -85,6 +85,14 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, "text/html", b"<html>key</html>")
             return self.send(200, "application/octet-stream", f["data"])
         page = u.path.strip("/")
+        mt = STATE.get("matome", {}).get(page)
+        if mt:
+            items = ""
+            for i, m in enumerate(mt["members"]):
+                items += (f'<div class="matomete_file"><div class="matomete_file_info"><span>x</span>'
+                          f'<span>{m["name"]}</span><span>（1 MB）</span></div>'
+                          f'<button class="download_panel_btn_dl" onclick="download({i}, \'{m["page"]}\')"></button></div>')
+            return self.send(200, "text/html; charset=utf-8", f'<div id="contents_matomete">{items}</div>'.encode())
         f = next((x for x in STATE["files"].values() if x["page"] == page), None)
         if f:
             html = f'<div id="dl">{f["name"]}</div><span class="dl_size">1 MB</span>'
@@ -93,6 +101,26 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        if u.path == "/matomete_get_url.php":
+            n = int(self.headers["Content-Length"])
+            q = parse_qs(self.rfile.read(n).decode(), keep_blank_values=True)
+            urls, keys = q.get("urls[]", []), q.get("dlkeys[]", [])
+            dlkey = q.get("dlkey", [""])[0]
+            if any(keys) and not dlkey:
+                return self.js({"status": 1})
+            members = []
+            for url in urls:
+                page = url.rsplit("/", 1)[1]
+                f = next((x for x in STATE["files"].values() if x["page"] == page), None)
+                if not f:
+                    return self.js({"status": 1})
+                members.append(f)
+            name = q.get("file_name", [""])[0] or f"gigafile-{int(time.time())}"
+            mid = f"1013-m{len(STATE.setdefault('matome', {}))}"
+            STATE["matome"][mid] = {"members": members, "file_name": name, "dlkey": dlkey,
+                                    "lifetime": q.get("lifetime", [""])[0], "keys": keys}
+            return self.js({"status": 0, "url": f"https://53.gigafile.nu/{mid}", "delkey": "md1",
+                            "file_name": name, "jwt": "x"})
         if u.path != "/upload_chunk.php":
             return self.send(404, "text/plain", b"nf")
         n = int(self.headers["Content-Length"])
@@ -313,6 +341,57 @@ cb2.close()
 # 6) 相手に送る文面
 txt = uploader.share_text(added)
 check(all(t.url in txt for t in added) and "パスワード: ab12" in txt, "相手に送る文面を作れる")
+
+# 7) 送信時にまとめる（フォルダ → 全部送ったら自動で1つのURL）
+ga = m.add_files([src], lifetime=14, dlkey="k9", group=True, group_name="撮影素材")
+g = next(x for x in m.groups if set(x.member_ids) == {t.id for t in ga})
+check(g.status == uploader.GROUP_WAIT, "送信が終わるまで、まとめは待機")
+check(wait(lambda: g.status in (uploader.DONE, uploader.ERROR), 90), "まとめが終了")
+check(g.status == uploader.DONE and g.url and g.verified, f"まとめURLを発行して中身も確認 {g.message}")
+mt = STATE["matome"].get(g.url.rsplit("/", 1)[1], {})
+check(len(mt.get("members", [])) == 3 and mt.get("file_name") == "撮影素材", "3ファイルを指定の名前でまとめる")
+check(mt.get("dlkey") == "k9" and mt.get("keys") == ["k9"] * 3 and mt.get("lifetime") == "14",
+      "まとめにもパスワードと期限が付く")
+txt = uploader.share_text_group(g, m.members(g))
+check(g.url in txt and "パスワード: k9" in txt and "3ファイル" in txt and "A_日本語ムービー.mov" in txt,
+      "まとめの送る文面")
+
+# 8) 送信済みのファイルを選んで、後からまとめる（名前なし → ギガファイル便が名前を付ける）
+for nm in ("p1.mov", "p2.mov"):
+    (tmp / nm).write_bytes(os.urandom(1024 * 1024 + 3))
+plain = m.add_files([tmp / "p1.mov", tmp / "p2.mov"], 7)
+wait(lambda: all(t.status == uploader.DONE for t in plain), 30)
+g2 = m.make_group(plain)
+check(wait(lambda: g2.status == uploader.DONE, 30), f"後からまとめる {g2.message}")
+check(g2.file_name.startswith("gigafile-"), "名前が空ならギガファイル便側の名前になる")
+
+# 9) パスワード付きを含むのに、まとめのパスワードが空 → 断る（公式と同じ決まり）
+keyed = [t for t in ga]
+try:
+    m.make_group(keyed, dlkey="")
+    check(False, "パスワード付きを含むまとめはパスワード必須")
+except uploader.UploadError:
+    check(True, "パスワード付きを含むまとめはパスワード必須")
+try:
+    m.make_group(plain, name="a/b")
+    check(False, "使えない文字の名前を断る")
+except uploader.UploadError:
+    check(True, "使えない文字の名前を断る")
+
+# 10) 1ファイルだけなら、まとめない
+one = m.add_files([src / "B.wav"], 7, "", group=True)
+check(not any(one[0].id in x.member_ids and len(x.member_ids) == 1 for x in m.groups), "1ファイルだけならまとめない")
+
+# 11) 再起動後もまとめURLを覚えている／待機中のまとめのメンバーは「完了を消す」で消えない
+m.save()
+m4 = uploader.UploadManager(tmp / "uploads.json", lambda e, x: None)
+g4 = next(x for x in m4.groups if x.id == g.id)
+check(g4.url == g.url and g4.status == uploader.DONE, "再起動後もまとめURLを記憶")
+w1, w2 = m4.tasks[0], m4.tasks[1]
+gw = uploader.Group([w1.id, w2.id])
+m4.groups.append(gw)
+m4.clear_done()
+check(w1 in m4.tasks and w2 in m4.tasks, "まとめ待ちのファイルは「完了を消す」で消えない")
 
 print("RESULT:", "PASS" if not FAIL else f"FAIL {FAIL}")
 srv.shutdown()
