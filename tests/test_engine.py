@@ -161,6 +161,7 @@ t = engine.Task("https://46.gigafile.nu/1001-single", "big", "big.bin", "20MB", 
 m.tasks.append(t); m._schedule()
 wait_until(lambda: t.done_bytes > 3 * 1024 * 1024, 20)
 m.pause(t); wait_until(lambda: t.status == engine.PAUSED, 10)
+paused_at = t.part_path.stat().st_size if t.part_path.exists() else -1
 print("paused at", t.done_bytes, "part exists", t.part_path.exists())
 # 再起動をシミュレート：新しいManagerで読み込み
 m.save()
@@ -221,7 +222,7 @@ for nm in ("素材A.mov", "clip1.mp4", "clip2.wav", "secret.zip", "big.bin"):
     check(p.exists() and hashlib.md5(p.read_bytes()).digest() == hashlib.md5(random_data[fid]).digest(), f"中身一致 {nm}")
 check(HITS.get("1001-single", [None])[1:] and all(h and h.startswith("bytes=") for h in HITS["1001-single"][1:]), "切断後にRangeで続きから")
 check(lk.status == engine.DONE, "パスワード入力で完了")
-check(t2.status == engine.DONE and HITS["big"] == ["bytes=5242880-"], "再起動後に続きから再開")
+check(t2.status == engine.DONE and HITS["big"] == [f"bytes={paused_at}-"] and paused_at > 0, f"再起動後に続きから再開 (停止位置 {paused_at})")
 check(t3.status == engine.DONE and Path(t3.final_path) == other / "move.bin", "ダウンロード中の保存先変更")
 check(t4.status == engine.QUEUED and Path(t4.dest_dir) == other, "待機中の保存先変更")
 check(not list(base.glob("*.gdlpart")), "途中ファイルが残らない")

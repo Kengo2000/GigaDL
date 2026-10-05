@@ -3,6 +3,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+for _s in (sys.stdout, sys.stderr):   # Windowsのコンソール(cp1252)でも日本語を出せるように
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 script = sys.argv[1]
 out = Path(__file__).resolve().parent / "out"
 out.mkdir(exist_ok=True)
