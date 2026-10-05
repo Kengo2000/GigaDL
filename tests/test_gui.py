@@ -295,6 +295,31 @@ clip = QApplication.clipboard().text()
 check(g.url in clip and "cam1.mov" in clip and "cam2.mov" in clip, "まとめの送る文面をコピー")
 check(any(n[0] == "まとめURLができました" for n in NOTES), "まとめ完了の通知")
 
+# --- 1つのZIPにして送る
+import io  # noqa: E402
+import zipfile  # noqa: E402
+from PySide6.QtWidgets import QInputDialog  # noqa: E402
+w.up.settings["zip_dir"] = str(TMP / "zipwork")
+w.up_tab.zipbox.setChecked(True)
+check(not w.up_tab.matome.isChecked(), "ZIPにするとまとめURLのチェックは外れる")
+zdir = TMP / "納品素材"
+(zdir / "sub").mkdir(parents=True)
+(zdir / "sub" / "clip.mov").write_bytes(os.urandom(3 * 1024 * 1024))
+(zdir / "readme.txt").write_bytes(b"memo")
+QInputDialog.getText = staticmethod(lambda *a, **k: ("納品素材", True))
+w.up_tab.add_paths([str(zdir)])
+zt = w.up.tasks[-1]
+check(zt.is_zip and zt.name == "納品素材.zip", "ZIPの送信を追加")
+check(wait_for(lambda: zt.status == uploader.DONE, 60), f"ZIPを作って送信完了 {zt.message}")
+pump(0.5)
+shot("8_ZIPで送信")
+zdata = DATA.get(zt.url.rsplit("/", 1)[1], b"")
+with zipfile.ZipFile(io.BytesIO(zdata)) as z:
+    check(sorted(z.namelist()) == ["納品素材/readme.txt", "納品素材/sub/clip.mov"]
+          and all(i.compress_type == zipfile.ZIP_STORED for i in z.infolist()),
+          "相手にはフォルダ構成のまま無圧縮ZIPで届く")
+check(not Path(zt.path).exists(), "送信後に作業用ZIPを削除")
+
 # --- 終了（確認ダイアログが出ない状態で閉じられる）
 w.close()
 pump(0.3)

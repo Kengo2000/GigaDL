@@ -123,12 +123,25 @@ class UploadTab(QWidget):
         self.key.setFixedWidth(150)
         self.key.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9A-Za-z]{0,4}")))
         h.addWidget(self.key)
-        h.addSpacing(16)
+        h.addStretch(1)
+        v.addLayout(h)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("複数ファイルのとき:"))
         self.matome = QCheckBox("まとめて1つのURLにする")
         self.matome.setToolTip("複数のファイルを送るとき、全部送り終わったら1つのダウンロードURLにまとめます")
         self.matome.setChecked(bool(self.mgr.settings.get("matome", False)))
-        self.matome.toggled.connect(lambda on: (self.mgr.settings.__setitem__("matome", on), self.mgr.save()))
+        self.matome.toggled.connect(lambda on: self._opt_changed("matome", on))
         h.addWidget(self.matome)
+        self.zipbox = QCheckBox("1つのZIPにして送る（無圧縮）")
+        self.zipbox.setToolTip("複数のファイルやフォルダを、圧縮せずに1つのZIPに固めてから送ります。\n"
+                               "フォルダの中の構成もそのまま入ります。送り終わったら作業用のZIPは自動で消します。")
+        self.zipbox.setChecked(bool(self.mgr.settings.get("zip", False)) and not self.matome.isChecked())
+        self.zipbox.toggled.connect(lambda on: self._opt_changed("zip", on))
+        h.addWidget(self.zipbox)
+        self.b_zipdir = QPushButton("ZIPの作業場所…")
+        self.b_zipdir.clicked.connect(self.choose_zip_dir)
+        self._zipdir_tip()
+        h.addWidget(self.b_zipdir)
         h.addStretch(1)
         v.addLayout(h)
 
@@ -207,6 +220,28 @@ class UploadTab(QWidget):
         self.update_buttons()
 
     # ------------------------------------------------- 追加
+    def _opt_changed(self, key, on):
+        # 「まとめて1つのURL」と「1つのZIP」はどちらか一方
+        if on and key == "zip" and self.matome.isChecked():
+            self.matome.setChecked(False)
+        if on and key == "matome" and self.zipbox.isChecked():
+            self.zipbox.setChecked(False)
+        self.mgr.settings[key] = on
+        self.mgr.save()
+
+    def _zipdir_tip(self):
+        self.b_zipdir.setToolTip(f"ZIPを一時的に作る場所（送り終わったら消します）:\n{self.mgr.zip_dir()}\n"
+                                 "元のファイルと同じくらいの空きが必要です。")
+
+    def choose_zip_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "ZIPを一時的に作る場所（空きのあるドライブ）",
+                                             str(self.mgr.zip_dir()))
+        if d:
+            self.mgr.settings["zip_dir"] = d
+            self.mgr.save()
+            self._zipdir_tip()
+            self.status.setText(f"ZIPの作業場所: {d}")
+
     def _save_lifetime(self):
         self.mgr.settings["lifetime"] = self.lifetime.currentData()
         self.mgr.save()
@@ -226,6 +261,8 @@ class UploadTab(QWidget):
         if not uploader.valid_dlkey(key):
             QMessageBox.warning(self, pu.APP_NAME, "パスワードは半角英数1〜4文字です。")
             return
+        if self.zipbox.isChecked():
+            return self._add_as_zip(paths, key)
         files = self.mgr.expand(paths)
         if not files:
             QMessageBox.information(self, pu.APP_NAME, "送れるファイルがありませんでした。")
@@ -253,6 +290,28 @@ class UploadTab(QWidget):
             return
         self.status.setText(f"アップロードに{len(added)}件追加しました")
 
+    def _add_as_zip(self, paths, key):
+        entries = uploader.zip_entries(paths)
+        if not entries:
+            QMessageBox.information(self, pu.APP_NAME, "送れるファイルがありませんでした。")
+            return
+        total = sum(fp.stat().st_size for fp, _ in entries)
+        first = Path(paths[0])
+        default = first.name if (len(paths) == 1 and first.is_dir()) else first.stem
+        name, ok = QInputDialog.getText(
+            self, pu.APP_NAME,
+            f"{len(entries)}個のファイル（合計 {human(total)}）を、圧縮せずに1つのZIPにして送ります。\n"
+            f"保持期限: {self.lifetime.currentData()}日　パスワード: {key or 'なし'}\n\nZIPの名前:",
+            QLineEdit.Normal, default)
+        if not ok:
+            return
+        try:
+            t = self.mgr.add_zip(paths, name, self.lifetime.currentData(), key)
+        except (uploader.UploadError, OSError) as ex:
+            QMessageBox.warning(self, pu.APP_NAME, str(ex))
+            return
+        self.status.setText(f"{t.name} を作ってから送ります（作業場所: {self.mgr.zip_dir()}）")
+
     # ------------------------------------------------- 一覧
     def add_row(self, t):
         r = self.table.rowCount()
@@ -275,14 +334,20 @@ class UploadTab(QWidget):
             return
         self.table.item(r, 1).setText(human(t.size))
         bar = self.bars[t.id]
-        frac = (t.sent / t.size) if t.size else 0
-        bar.setValue(int(frac * 1000))
-        bar.setFormat(f"{frac*100:.1f}%  {human(t.sent)}")
-        running = t.status == RUNNING and t.speed > 0
+        zipping = t.is_zip and not t.zip_ready
+        if zipping:
+            zf = (t.zip_done / t.zip_total) if t.zip_total else 0
+            bar.setValue(int(zf * 1000))
+            bar.setFormat(f"ZIP作成 {zf*100:.0f}%")
+        else:
+            frac = (t.sent / t.size) if t.size else 0
+            bar.setValue(int(frac * 1000))
+            bar.setFormat(f"{frac*100:.1f}%  {human(t.sent)}")
+        running = t.status == RUNNING and t.speed > 0 and not zipping
         self.table.item(r, 3).setText(f"{human(t.speed)}/s" if running else "")
         self.table.item(r, 4).setText(fmt_eta((t.size - t.sent) / t.speed) if running else "")
         extra = []
-        if t.status == RUNNING:
+        if t.status == RUNNING and not zipping:
             extra.append(f"{min(t.next_chunk + 1, t.chunks)}/{t.chunks}")
         if t.message:
             extra.append(t.message)

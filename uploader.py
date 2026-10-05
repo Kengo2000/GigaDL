@@ -11,7 +11,10 @@ GigaDL アップロード部
 import json
 import os
 import re
+import shutil
 import threading
+import unicodedata
+import zipfile
 import time
 import uuid
 from pathlib import Path
@@ -29,6 +32,36 @@ DLKEY_RE = re.compile(r"^[0-9A-Za-z]{1,4}$")
 QUEUED, RUNNING, PAUSED, DONE, ERROR, RETRYING = (
     engine.QUEUED, engine.RUNNING, engine.PAUSED, engine.DONE, engine.ERROR, engine.RETRYING)
 VERIFYING = "確認中"
+ZIP_BLOCK = 4 * 1024 * 1024
+_ZIP_THROTTLE = 0.0        # テスト用（ZIP作成をわざと遅くする秒数）
+
+
+def zip_entries(paths):
+    """ZIPに入れる (実ファイル, ZIP内の名前) の一覧。
+    フォルダはフォルダ名ごと入れる。名前はWindowsでも崩れないようNFCに揃える。"""
+    out = []
+    for p in paths:
+        p = Path(p)
+        if p.is_dir():
+            base = p.parent
+            for root, dirs, files in os.walk(p):
+                dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                for f in sorted(files):
+                    if f.startswith(".") or f in ("Thumbs.db", "desktop.ini"):
+                        continue
+                    fp = Path(root) / f
+                    out.append((fp, unicodedata.normalize("NFC", fp.relative_to(base).as_posix())))
+        elif p.is_file() and not p.name.startswith("."):
+            out.append((p, unicodedata.normalize("NFC", p.name)))
+    return out
+
+
+def safe_zip_name(name):
+    name = unicodedata.normalize("NFC", (name or "").strip())
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        name = "まとめ"
+    return name if name.lower().endswith(".zip") else name + ".zip"
 
 
 class UploadError(Exception):
@@ -117,7 +150,8 @@ class ChunkBody:
 class UploadTask:
     FIELDS = ("id", "path", "name", "size", "mtime", "lifetime", "dlkey", "status",
               "message", "upload_id", "server", "cookies", "next_chunk", "chunk_size",
-              "url", "srv_filename", "delkey", "added_at", "finished_at", "restarted")
+              "url", "srv_filename", "delkey", "added_at", "finished_at", "restarted",
+              "zip_sources", "zip_ready", "zip_total")
 
     def __init__(self, path, lifetime=7, dlkey=""):
         p = Path(path)
@@ -142,12 +176,43 @@ class UploadTask:
         self.added_at = time.time()
         self.finished_at = 0
         self.restarted = False
+        self.zip_sources = []      # ZIPにして送るときの元のファイル/フォルダ
+        self.zip_ready = True
+        self.zip_total = 0
         self._init_runtime()
+
+    @classmethod
+    def for_zip(cls, sources, zip_path, total, lifetime=7, dlkey=""):
+        """複数のファイル/フォルダを1つのZIP（無圧縮）にしてから送るタスク"""
+        t = cls.__new__(cls)
+        t.id = uuid.uuid4().hex
+        t.path = str(zip_path)
+        t.name = Path(zip_path).name
+        t.size = total
+        t.mtime = 0
+        t.lifetime = int(lifetime)
+        t.dlkey = dlkey or ""
+        t.status = QUEUED
+        t.message = ""
+        t.upload_id, t.server, t.cookies = "", "", {}
+        t.next_chunk, t.chunk_size = 0, UP_CHUNK
+        t.url = t.srv_filename = t.delkey = ""
+        t.added_at, t.finished_at, t.restarted = time.time(), 0, False
+        t.zip_sources = [str(p) for p in sources]
+        t.zip_ready = False
+        t.zip_total = total
+        t._init_runtime()
+        return t
+
+    @property
+    def is_zip(self):
+        return bool(self.zip_sources)
 
     def _init_runtime(self):
         self.sent = self.next_chunk * self.chunk_size if self.chunk_size else 0
         self.sent = min(self.sent, self.size)
         self.speed = 0.0
+        self.zip_done = 0
         self._stop = threading.Event()
         self._thread = None
 
@@ -168,6 +233,9 @@ class UploadTask:
         t.next_chunk = t.next_chunk or 0
         t.dlkey = t.dlkey or ""
         t.message = t.message or ""
+        t.zip_sources = t.zip_sources or []
+        t.zip_ready = True if t.zip_ready is None else t.zip_ready
+        t.zip_total = t.zip_total or 0
         t._init_runtime()
         if t.status in (RUNNING, RETRYING, VERIFYING):
             t.status = PAUSED
@@ -309,6 +377,91 @@ class UploadManager:
         self._schedule()
         return added
 
+    # --- ZIPにして送る
+    def zip_dir(self):
+        d = Path(self.settings.get("zip_dir") or (self.state_path.parent / "ZIP作業"))
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def add_zip(self, paths, name, lifetime, dlkey=""):
+        """ファイル/フォルダを1つのZIP（無圧縮）にしてから送る"""
+        if not valid_dlkey(dlkey):
+            raise UploadError("パスワードは半角英数1〜4文字です")
+        entries = zip_entries(paths)
+        if not entries:
+            raise UploadError("ZIPに入れるファイルがありません")
+        total = sum(fp.stat().st_size for fp, _ in entries)
+        d = self.zip_dir()
+        self._check_space(d, total + 1024 * len(entries))
+        zp = engine.unique_path(d / safe_zip_name(name))
+        zp.touch()          # 名前を確保（同時に同じ名前を使わないように）
+        t = UploadTask.for_zip(paths, zp, total, lifetime, dlkey)
+        with self.lock:
+            self.tasks.append(t)
+            self.listener("up_added", t)
+        self.save()
+        self._schedule()
+        return t
+
+    @staticmethod
+    def _check_space(d, need):
+        free = shutil.disk_usage(d).free
+        if free < need + 200 * 1024 * 1024:
+            raise UploadError(f"ZIPの作業場所（{d}）の空きが足りません。"
+                              f"必要 {engine.human(need)}・空き {engine.human(free)}。"
+                              "「ZIPの作業場所」を空きのあるドライブに変えてください")
+
+    def _build_zip(self, t):
+        entries = zip_entries(t.zip_sources)
+        if not entries:
+            raise UploadError("ZIPに入れる元のファイルが見つかりません（移動・削除された可能性）")
+        zp = Path(t.path)
+        try:
+            total = sum(fp.stat().st_size for fp, _ in entries)
+            self._check_space(zp.parent, total + 1024 * len(entries))
+        except OSError as ex:
+            raise UploadError(f"ZIPを作れませんでした: {ex}")
+        tmp = zp.with_name(zp.name + ".part")
+        t.zip_total, t.zip_done = total, 0
+        t.message = "ZIP作成中"
+        self.listener("up_update", t)
+        last = [time.monotonic()]
+        try:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+                for fp, arc in entries:
+                    zi = zipfile.ZipInfo.from_file(fp, arc)
+                    zi.compress_type = zipfile.ZIP_STORED
+                    with open(fp, "rb") as src, z.open(zi, "w") as dst:
+                        while True:
+                            if t._stop.is_set():
+                                raise Stopped()
+                            b = src.read(ZIP_BLOCK)
+                            if not b:
+                                break
+                            dst.write(b)
+                            t.zip_done += len(b)
+                            if _ZIP_THROTTLE:
+                                time.sleep(_ZIP_THROTTLE)
+                            now = time.monotonic()
+                            if now - last[0] >= 0.3:
+                                last[0] = now
+                                t.message = f"ZIP作成中 {t.zip_done * 100 // max(total, 1)}%"
+                                self.listener("up_update", t)
+            os.replace(tmp, zp)
+        except Stopped:
+            _unlink(tmp)
+            raise
+        except OSError as ex:
+            _unlink(tmp)
+            raise UploadError(f"ZIPを作れませんでした: {ex}")
+        st = zp.stat()
+        t.size, t.mtime = st.st_size, st.st_mtime
+        t.zip_ready = True
+        t.next_chunk, t.sent, t.upload_id = 0, 0, ""
+        t.message = ""
+        self.save()
+        self.listener("up_update", t)
+
     # --- まとめ
     def members(self, g):
         by_id = {t.id: t for t in self.tasks}
@@ -447,6 +600,9 @@ class UploadManager:
             t._stop.set()
             if t._thread:
                 t._thread.join(timeout=15)
+        if t.is_zip:            # 作業用ZIPは片付ける（元のファイルは消さない）
+            _unlink(Path(t.path))
+            _unlink(Path(t.path + ".part"))
         with self.lock:
             if t in self.tasks:
                 self.tasks.remove(t)
@@ -562,6 +718,8 @@ class UploadManager:
         t.cookies = {}
 
     def _upload(self, t: UploadTask):
+        if t.is_zip and not t.zip_ready:
+            self._build_zip(t)
         self._check_file(t)
         session = engine.new_session()
         if t.upload_id and t.next_chunk > 0:
@@ -653,6 +811,8 @@ class UploadManager:
         t.finished_at = time.time()
         t.sent = t.size
         t.message = ""
+        if t.is_zip:            # 送り終わったら作業用ZIPを消す
+            _unlink(Path(t.path))
 
     def _apply_dlkey(self, t, session):
         if not (t.srv_filename and t.delkey):
@@ -679,6 +839,13 @@ class UploadManager:
             n = int(r.headers.get("Content-Length") or 0)
         if n != t.size:
             raise UploadError(f"ギガファイル便側のサイズが一致しません（元 {t.size} / 先 {n}）。もう一度送り直してください")
+
+
+def _unlink(p):
+    try:
+        Path(p).unlink()
+    except (FileNotFoundError, OSError):
+        pass
 
 
 def requests_session_for(t):

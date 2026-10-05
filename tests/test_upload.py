@@ -393,6 +393,65 @@ m4.groups.append(gw)
 m4.clear_done()
 check(w1 in m4.tasks and w2 in m4.tasks, "まとめ待ちのファイルは「完了を消す」で消えない")
 
+# 12) ZIPにして送る（無圧縮・フォルダ構成そのまま・日本語名はNFC）
+import io
+import unicodedata
+import zipfile
+zsrc = tmp / "撮影データ"
+(zsrc / "カメラA").mkdir(parents=True)
+nfd_name = unicodedata.normalize("NFD", "がぎぐ_ムービー.mov")       # Macによくある濁点分離の名前
+zfiles = {"カメラA/" + nfd_name: os.urandom(3 * 1024 * 1024 + 11), "メモ.txt": b"hello" * 1000,
+          ".DS_Store": b"x"}
+for k, v in zfiles.items():
+    (zsrc / k).write_bytes(v)
+m5 = uploader.UploadManager(tmp / "u5.json", lambda e, x: None)
+m5.settings["zip_dir"] = str(tmp / "zipwork")
+zt = m5.add_zip([zsrc], "撮影データ", 30, "z1")
+check(zt.name == "撮影データ.zip" and zt.is_zip, "ZIPの名前")
+check(wait(lambda: zt.status in (uploader.DONE, uploader.ERROR), 60), "ZIPを作って送信が終了")
+check(zt.status == uploader.DONE, f"ZIP送信完了 {zt.message}")
+zb = stored(zt).get("data", b"")
+with zipfile.ZipFile(io.BytesIO(zb)) as z:
+    names = z.namelist()
+    infos = z.infolist()
+    ok_content = z.read("撮影データ/カメラA/がぎぐ_ムービー.mov") == zfiles["カメラA/" + nfd_name] \
+        and z.read("撮影データ/メモ.txt") == zfiles["メモ.txt"]
+check(sorted(names) == ["撮影データ/カメラA/がぎぐ_ムービー.mov", "撮影データ/メモ.txt"],
+      "フォルダ構成のまま入る・隠しファイルは除く・名前はNFC")
+check(all(i.compress_type == zipfile.ZIP_STORED for i in infos), "無圧縮（書庫化のみ）")
+check(ok_content, "ZIPの中身が元と一致")
+check(stored(zt).get("dlkey") == "z1", "ZIPにもパスワード")
+check(not Path(zt.path).exists() and not list((tmp / "zipwork").glob("*.part")), "送信後に作業用ZIPを削除")
+
+# 13) ZIP作成中に一時停止 → 再開で作り直して完了
+uploader.ZIP_BLOCK = 256 * 1024
+uploader._ZIP_THROTTLE = 0.02
+big2 = tmp / "大きい"
+big2.mkdir()
+(big2 / "a.mov").write_bytes(os.urandom(20 * 1024 * 1024))
+orig_write = zipfile.ZipFile.write
+zt2 = m5.add_zip([big2], "", 7)
+check(zt2.name == "まとめ.zip", "名前が空なら「まとめ.zip」")
+wait(lambda: "ZIP作成中" in zt2.message, 20)
+m5.pause(zt2)
+check(wait(lambda: zt2.status == uploader.PAUSED, 15) and not zt2.zip_ready, "ZIP作成中に一時停止")
+check(not list((tmp / "zipwork").glob("*.part")), "作りかけのZIPは消す")
+uploader._ZIP_THROTTLE = 0.0
+m5.resume(zt2)
+check(wait(lambda: zt2.status == uploader.DONE, 90), f"再開で作り直して完了 {zt2.message}")
+with zipfile.ZipFile(io.BytesIO(stored(zt2)["data"])) as z:
+    check(z.read("大きい/a.mov") == (big2 / "a.mov").read_bytes(), "作り直したZIPも中身が一致")
+
+# 14) 作業場所の空きが足りなければ、始める前に知らせる
+real_du = shutil.disk_usage
+uploader.shutil.disk_usage = lambda p: real_du(p)._replace(free=1024)
+try:
+    m5.add_zip([zsrc], "x", 7)
+    check(False, "空き容量不足を知らせる")
+except uploader.UploadError as ex:
+    check("空きが足りません" in str(ex), "空き容量不足を知らせる")
+uploader.shutil.disk_usage = real_du
+
 print("RESULT:", "PASS" if not FAIL else f"FAIL {FAIL}")
 srv.shutdown()
 shutil.rmtree(tmp, ignore_errors=True)
