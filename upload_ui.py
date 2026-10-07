@@ -356,7 +356,10 @@ class UploadTab(QWidget):
         g = self.mgr.group_of(t)
         if g:
             extra.append(f"まとめ: {g.title}")
-        st = t.status + (f"（{' / '.join(extra)}）" if extra else "")
+        label = "ZIP作成中" if zipping and t.status == RUNNING else t.status
+        if zipping and t.message.startswith("ZIP作成中"):
+            extra = [e for e in extra if not e.startswith("ZIP作成中")]
+        st = label + (f"（{' / '.join(extra)}）" if extra else "")
         it = self.table.item(r, 5)
         it.setText(st)
         it.setToolTip(st)

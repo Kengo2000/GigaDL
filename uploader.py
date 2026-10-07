@@ -29,8 +29,10 @@ LIFETIMES = (3, 5, 7, 14, 30, 60, 100)
 MAX_RETRIES = 30
 DLKEY_RE = re.compile(r"^[0-9A-Za-z]{1,4}$")
 
-QUEUED, RUNNING, PAUSED, DONE, ERROR, RETRYING = (
-    engine.QUEUED, engine.RUNNING, engine.PAUSED, engine.DONE, engine.ERROR, engine.RETRYING)
+QUEUED, PAUSED, DONE, ERROR = engine.QUEUED, engine.PAUSED, engine.DONE, engine.ERROR
+RUNNING = "アップロード中"          # ダウンロード側の「ダウンロード中」とは別の言葉にする
+RETRYING = "再送待ち"
+_LEGACY_ACTIVE = (engine.RUNNING, engine.RETRYING)   # 1.3以前に保存された状態
 VERIFYING = "確認中"
 ZIP_BLOCK = 4 * 1024 * 1024
 _ZIP_THROTTLE = 0.0        # テスト用（ZIP作成をわざと遅くする秒数）
@@ -237,7 +239,7 @@ class UploadTask:
         t.zip_ready = True if t.zip_ready is None else t.zip_ready
         t.zip_total = t.zip_total or 0
         t._init_runtime()
-        if t.status in (RUNNING, RETRYING, VERIFYING):
+        if t.status in (RUNNING, RETRYING, VERIFYING) + _LEGACY_ACTIVE:
             t.status = PAUSED
         if t.status == DONE:
             t.sent = t.size

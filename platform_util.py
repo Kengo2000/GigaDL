@@ -10,6 +10,8 @@ IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")
 
 APP_NAME = "GigaDL"
+APP_VERSION = "1.3.1"
+APP_DATE = "2026-10-07"
 FILE_MANAGER = "Finder" if IS_MAC else ("エクスプローラー" if IS_WIN else "ファイルマネージャ")
 
 _NO_WINDOW = 0x08000000 if IS_WIN else 0   # CREATE_NO_WINDOW

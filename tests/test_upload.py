@@ -452,6 +452,21 @@ except uploader.UploadError as ex:
     check("空きが足りません" in str(ex), "空き容量不足を知らせる")
 uploader.shutil.disk_usage = real_du
 
+# 15) アップロードの状態は「アップロード中」（「ダウンロード中」と出さない）
+check(uploader.RUNNING == "アップロード中" and "ダウンロード" not in uploader.RETRYING, "アップロードの状態の言葉")
+seen = []
+m6 = uploader.UploadManager(tmp / "u6.json", lambda e, x: x is not None and hasattr(x, "status") and seen.append(x.status))
+(tmp / "s.mov").write_bytes(os.urandom(3 * 1024 * 1024))
+t6 = m6.add_files([tmp / "s.mov"], 7)[0]
+wait(lambda: t6.status == uploader.DONE, 30)
+check("アップロード中" in seen and "ダウンロード中" not in seen, "送信中の表示は「アップロード中」")
+# 古い版（1.3まで）が保存した「ダウンロード中」は一時停止として読み込む
+old = json.loads((tmp / "u6.json").read_text("utf-8"))
+old["tasks"][0]["status"] = "ダウンロード中"
+(tmp / "u7.json").write_text(json.dumps(old, ensure_ascii=False), "utf-8")
+m7 = uploader.UploadManager(tmp / "u7.json", lambda e, x: None)
+check(m7.tasks[0].status == uploader.PAUSED, "古い版の保存状態も読み込める")
+
 print("RESULT:", "PASS" if not FAIL else f"FAIL {FAIL}")
 srv.shutdown()
 shutil.rmtree(tmp, ignore_errors=True)

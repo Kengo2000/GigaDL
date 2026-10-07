@@ -61,7 +61,7 @@ def fmt_eta(sec):
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} {pu.APP_VERSION}")
         self.resize(980, 620)
         self.bridge = Bridge()
         self.bridge.event.connect(self.on_event)
