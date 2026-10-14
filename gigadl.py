@@ -422,6 +422,8 @@ class Main(QMainWindow):
 
     # ----------------------------------------------------- エンジンからのイベント
     def on_event(self, ev, t):
+        if getattr(self, "_closing", False):      # 閉じた後に届いた知らせは無視する
+            return
         if ev.startswith("up_"):
             self.up_tab.on_event(ev, t)
             return
@@ -472,6 +474,8 @@ class Main(QMainWindow):
 
     def ask_key(self, tasks):
         """パスワードを聞いて、入れたら再開する"""
+        if getattr(self, "_closing", False) or not self.isVisible():
+            return
         if getattr(self, "_asking_key", False):
             self._pending_key.extend(t for t in tasks if t not in self._pending_key)
             return
@@ -559,6 +563,7 @@ class Main(QMainWindow):
             if r != QMessageBox.Ok:
                 e.ignore()
                 return
+        self._closing = True
         self.mgr.shutdown()
         self.up.shutdown()
         self.caff.set(False)
