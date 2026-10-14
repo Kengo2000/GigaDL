@@ -368,5 +368,5 @@ check(not w.isVisible(), "ウィンドウを閉じられる")
 
 print("platform:", sys.platform, "| Qt:", __import__("PySide6").__version__, flush=True)
 print("RESULT:", "PASS" if not FAIL else f"FAIL {FAIL}", flush=True)
-srv.shutdown()
-os._exit(1 if FAIL else 0)
+sys.stdout.flush(); sys.stderr.flush()
+os._exit(1 if FAIL else 0)   # 仮サーバーは止めずに即終了（Windows ARMで片付け中に落ちるため）
