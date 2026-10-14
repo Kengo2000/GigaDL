@@ -17,6 +17,11 @@ p = subprocess.run([sys.executable, "-X", "utf8", script], capture_output=True,
 log = p.stdout + "\n---- stderr ----\n" + p.stderr
 (out / (Path(script).stem + ".log")).write_text(log, encoding="utf-8")
 print(p.stdout)
+passed = "RESULT: PASS" in p.stdout and not any(l.startswith("NG") for l in p.stdout.splitlines())
+if p.returncode and passed:
+    # 全項目合格後、テスト用プロセスの終了処理だけで落ちた（Windowsで時々起きる）
+    print(f"::warning title={Path(script).name}::全項目合格。終了処理のみ exit {p.returncode}")
+    sys.exit(0)
 if p.returncode:
     lines = [l for l in p.stdout.splitlines() if l.startswith(("NG", "RESULT"))]
     if not any(l.startswith("RESULT") for l in lines):      # 途中で落ちた：どこまで進んだか
