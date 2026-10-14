@@ -123,7 +123,7 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 class Local(HTTPAdapter):
     def send(self, request, **kw):
         u = urlparse(request.url)
-        assert u.hostname.endswith("gigafile.jp"), request.url
+        assert u.hostname.endswith(("gigafile.jp", "gigafile.nu")), request.url
         request.url = f"http://127.0.0.1:{port}{u.path}" + (f"?{u.query}" if u.query else "")
         return super().send(request, **kw)
 

@@ -127,7 +127,8 @@ def parse_page_ex(url: str, session=None):
 def check_dlkey(session, page_url, file_id, key):
     """公式サイトと同じくダウンロード前にパスワードを確かめる。
     0=正しい / 1=違う / 3=失敗回数の上限でロック / None=確認できなかった"""
-    base = normalize_url(page_url).rsplit("/", 1)[0]
+    # 公式のページと同じホスト（○○.gigafile.nu）に問い合わせる
+    base = re.sub(r"\.gigafile\.jp\b", ".gigafile.nu", page_url.strip()).rsplit("/", 1)[0]
     try:
         r = session.get(f"{base}/check_dlkey.php",
                         params={"file": file_id, "dlkey": key, "is_zip": 0,
