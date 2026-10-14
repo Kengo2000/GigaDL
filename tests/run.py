@@ -19,6 +19,8 @@ log = p.stdout + "\n---- stderr ----\n" + p.stderr
 print(p.stdout)
 if p.returncode:
     lines = [l for l in p.stdout.splitlines() if l.startswith(("NG", "RESULT"))]
+    if not any(l.startswith("RESULT") for l in lines):      # 途中で落ちた：どこまで進んだか
+        lines = ["(途中で終了) 最後の出力:"] + p.stdout.strip().splitlines()[-6:]
     err = p.stderr.strip().splitlines()
     tb = []
     if "Traceback" in p.stderr:
