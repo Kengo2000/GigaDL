@@ -23,6 +23,7 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
 # 状態
+KEY_WAIT = "パスワード待ち"
 QUEUED, RUNNING, PAUSED, DONE, ERROR, RETRYING, MOVING = (
     "待機中", "ダウンロード中", "一時停止", "完了", "エラー", "再接続中", "移動中")
 
@@ -80,6 +81,12 @@ def _real_filename(session, server_id, file_id, fallback):
 
 def parse_page(url: str, session=None):
     """ページを解析して [(ファイル名, サイズ文字列, file_id), ...] を返す。"""
+    return parse_page_ex(url, session)[0]
+
+
+def parse_page_ex(url: str, session=None):
+    """(ファイル一覧, パスワードが必要か) を返す。
+    パスワード付きのページには入力欄 #dlkey があり、download('…', true, …) になっている。"""
     m = URL_RE.match(url.strip())
     if not m:
         raise GigaError("ギガファイル便のURLではありません")
@@ -89,6 +96,8 @@ def parse_page(url: str, session=None):
     r.raise_for_status()
     # 文字コード未指定でも日本語ファイル名が化けないようバイト列から解析
     soup = BeautifulSoup(r.content, "html.parser", from_encoding=_encoding(r))
+    needs_key = bool(soup.select_one("#dlkey")) or bool(
+        re.search(r"download\('[^']+',\s*true", r.text))
     files = []
     try:
         if soup.select_one("#contents_matomete"):
@@ -112,7 +121,23 @@ def parse_page(url: str, session=None):
         files = []
     if not files:
         raise GigaError("ページを解析できませんでした（期限切れ・削除済み、またはページ構成の変更）")
-    return files
+    return files, needs_key
+
+
+def check_dlkey(session, page_url, file_id, key):
+    """公式サイトと同じくダウンロード前にパスワードを確かめる。
+    0=正しい / 1=違う / 3=失敗回数の上限でロック / None=確認できなかった"""
+    base = normalize_url(page_url).rsplit("/", 1)[0]
+    try:
+        r = session.get(f"{base}/check_dlkey.php",
+                        params={"file": file_id, "dlkey": key, "is_zip": 0,
+                                "_": int(time.time() * 1000)},
+                        headers={"Referer": page_url, "X-Requested-With": "XMLHttpRequest"},
+                        timeout=20)
+        r.raise_for_status()
+        return r.json().get("status")
+    except Exception:
+        return None
 
 
 def _encoding(r):
@@ -139,16 +164,17 @@ def unique_path(p: Path) -> Path:
 # ---------------------------------------------------------------- タスク
 
 class Task:
-    FIELDS = ("id", "page_url", "file_id", "name", "size_str", "key",
+    FIELDS = ("id", "page_url", "file_id", "name", "size_str", "key", "needs_key",
               "dest_dir", "status", "total", "done_bytes", "message", "final_path")
 
-    def __init__(self, page_url, file_id, name, size_str, key, dest_dir):
+    def __init__(self, page_url, file_id, name, size_str, key, dest_dir, needs_key=False):
         self.id = uuid.uuid4().hex
         self.page_url = normalize_url(page_url)
         self.file_id = file_id
         self.name = sanitize(name)
         self.size_str = size_str
         self.key = key or ""
+        self.needs_key = bool(needs_key)
         self.dest_dir = str(dest_dir)
         self.status = QUEUED
         self.total = 0
@@ -244,20 +270,39 @@ class Manager:
         """URLを解析してタスクを追加（別スレッド）"""
         def work():
             try:
-                files = parse_page(url)
+                files, needs_key = parse_page_ex(url)
             except Exception as ex:
                 self.listener("resolve_error", (url, str(ex)))
                 return
+            waiting = []
             with self.lock:
                 for name, size, fid in files:
                     dup = next((t for t in self.tasks if t.file_id == fid
                                 and t.status != DONE), None)
                     if dup:
+                        # 同じURLをもう一度追加 → パスワードを入れ直して再開（新しく作らない）
+                        if key:
+                            dup.key = key
+                        if needs_key:
+                            dup.needs_key = True
+                        if dup.status in (PAUSED, ERROR, KEY_WAIT):
+                            if dup.needs_key and not dup.key:
+                                dup.status, dup.message = KEY_WAIT, "パスワードを入力してください"
+                                waiting.append(dup)
+                            else:
+                                dup.status, dup.message = QUEUED, ""
+                        self.listener("update", dup)
                         continue
-                    t = Task(url, fid, name, size, key, dest_dir)
+                    t = Task(url, fid, name, size, key, dest_dir, needs_key)
+                    if needs_key and not key:
+                        # 入れ忘れ：ダウンロードを試さずに待つ（失敗回数を増やさない）
+                        t.status, t.message = KEY_WAIT, "パスワードを入力してください"
+                        waiting.append(t)
                     self.tasks.append(t)
                     self.listener("added", t)
             self.save()
+            if waiting:
+                self.listener("need_key", waiting)
             self._schedule()
         threading.Thread(target=work, daemon=True).start()
 
@@ -272,15 +317,34 @@ class Manager:
         self.save()
 
     def resume(self, task: Task, key=None):
+        """再開。パスワードが必要なのに無いときは「パスワード待ち」にして入力を促す"""
+        need = []
         with self.lock:
             if key is not None:
                 task.key = key
-            if task.status in (PAUSED, ERROR):
-                task.status = QUEUED
-                task.message = ""
+            if task.status in (PAUSED, ERROR, KEY_WAIT):
+                if task.needs_key and not task.key:
+                    task.status, task.message = KEY_WAIT, "パスワードを入力してください"
+                    need.append(task)
+                else:
+                    task.status = QUEUED
+                    task.message = ""
                 self.listener("update", task)
         self.save()
+        if need:
+            self.listener("need_key", need)
         self._schedule()
+
+    def set_key(self, tasks, key):
+        """選んだファイルにパスワードを入れて、待っていたものは再開する"""
+        for t in tasks:
+            if t.status == DONE:
+                continue
+            if t.status in (RUNNING, RETRYING, QUEUED):
+                t.key = key
+            else:
+                self.resume(t, key=key)
+        self.save()
 
     def remove(self, task: Task, delete_part=True):
         if task.status in (RUNNING, RETRYING):
@@ -352,7 +416,9 @@ class Manager:
     def resume_all(self):
         with self.lock:
             for t in self.tasks:
-                if t.status in (PAUSED, ERROR):
+                if t.status in (PAUSED, ERROR, KEY_WAIT):
+                    if t.needs_key and not t.key:
+                        continue
                     t.status = QUEUED
                     t.message = ""
                     self.listener("update", t)
@@ -396,7 +462,9 @@ class Manager:
                 self._download(t)
                 break
             except KeyRequired as ex:
-                t.status, t.message = ERROR, str(ex)
+                # パスワードの問題はエラーではなく「パスワード待ち」にして、入れ直せるようにする
+                t.needs_key = True
+                t.status, t.message = KEY_WAIT, str(ex)
                 break
             except GigaError as ex:
                 t.status, t.message = ERROR, str(ex)
@@ -431,6 +499,8 @@ class Manager:
             self.listener("done", t)
         elif t.status == ERROR:
             self.listener("error", t)
+        elif t.status == KEY_WAIT:
+            self.listener("need_key", [t])
         else:
             self.listener("update", t)
         self._schedule()
@@ -440,6 +510,17 @@ class Manager:
         s = new_session()
         # ページを開いてクッキーを取得
         s.get(t.page_url, timeout=30).raise_for_status()
+
+        # パスワード付き：公式サイトと同じく先に確認する（間違いでダウンロードを試さない）
+        if t.needs_key:
+            if not t.key:
+                raise KeyRequired("パスワードを入力してください")
+            st = check_dlkey(s, t.page_url, t.file_id, t.key)
+            if st == 1:
+                raise KeyRequired("パスワードが違います。入れ直してください")
+            if st == 3:
+                raise KeyRequired("パスワードの失敗回数が上限に達しました。"
+                                  "しばらく時間をおいてから入れ直してください")
 
         part = t.part_path
         offset = part.stat().st_size if part.exists() else 0
@@ -456,7 +537,7 @@ class Manager:
             if "text/html" in ctype:
                 if t.key:
                     raise KeyRequired("パスワードが違うか、ファイルの保持期限が切れています")
-                raise KeyRequired("パスワード（ダウンロードキー）が必要です")
+                raise KeyRequired("パスワードを入力してください")
 
             if r.status_code == 206:
                 total = parse_total(r.headers.get("Content-Range"))

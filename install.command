@@ -62,7 +62,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleIdentifier</key><string>local.gigadl</string>
   <key>CFBundleExecutable</key><string>GigaDL</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.3.1</string>
+  <key>CFBundleShortVersionString</key><string>1.3.2</string>
   <key>CFBundleIconFile</key><string>GigaDL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>

@@ -21,7 +21,7 @@ import engine
 import platform_util as pu
 import uploader
 from upload_ui import UploadTab
-from engine import DONE, ERROR, MOVING, PAUSED, QUEUED, RETRYING, RUNNING, human
+from engine import DONE, ERROR, KEY_WAIT, MOVING, PAUSED, QUEUED, RETRYING, RUNNING, human
 from platform_util import notify, reveal
 
 APP_NAME = pu.APP_NAME
@@ -217,7 +217,16 @@ class Main(QMainWindow):
 
     def add(self):
         lines = [u for u in self.urls.toPlainText().split() if u.strip()]
+        key = self.key.text().strip()
         if not lines:
+            # URLは空でパスワードだけ入れた → 選んでいる行（またはパスワード待ちの行）に使う
+            if key:
+                targets = [t for t in self.selected() if t.status != DONE] or \
+                          [t for t in self.mgr.tasks if t.status == KEY_WAIT]
+                if targets:
+                    self.mgr.set_key(targets, key)
+                    self.key.clear()
+                    self.status.setText(f"{len(targets)}件にパスワードを入れて再開しました")
             return
         bad = [u for u in lines if not engine.is_gigafile_url(u)]
         good = [u for u in lines if engine.is_gigafile_url(u)]
@@ -233,7 +242,6 @@ class Main(QMainWindow):
                 return
             dest = d
             self.remember_dir(d)
-        key = self.key.text().strip()
         for u in good:
             self.mgr.add_url(u, key, dest)
         self.urls.clear()
@@ -347,7 +355,7 @@ class Main(QMainWindow):
         it = self.table.item(r, 5)
         it.setText(st)
         it.setToolTip(st)
-        color = {DONE: "#2fa84f", ERROR: "#e5484d", RETRYING: "#d39e00"}.get(t.status)
+        color = {DONE: "#2fa84f", ERROR: "#e5484d", RETRYING: "#d39e00", KEY_WAIT: "#e5833d"}.get(t.status)
         it.setForeground(QBrush(QColor(color)) if color else self.palette().text())
 
     def rebuild(self):
@@ -375,7 +383,7 @@ class Main(QMainWindow):
         s = self.selected()
         st = {t.status for t in s}
         self.b_pause.setEnabled(bool(st & {RUNNING, RETRYING, QUEUED}))
-        self.b_resume.setEnabled(bool(st & {PAUSED, ERROR}))
+        self.b_resume.setEnabled(bool(st & {PAUSED, ERROR, KEY_WAIT}))
         self.b_key.setEnabled(bool(s) and not st & {DONE, MOVING})
         self.b_dest.setEnabled(bool(s) and bool(st - {DONE, MOVING}))
         self.b_remove.setEnabled(bool(s) and MOVING not in st)
@@ -417,6 +425,15 @@ class Main(QMainWindow):
         if ev.startswith("up_"):
             self.up_tab.on_event(ev, t)
             return
+        if ev == "need_key":
+            waiting = list(t)
+            for w in waiting:
+                self.update_row(w)
+            notify("パスワードが必要です",
+                   waiting[0].name if len(waiting) == 1 else f"{len(waiting)}個のファイル")
+            QTimer.singleShot(0, lambda ts=waiting: self.ask_key(ts))
+            self.update_buttons()
+            return
         if ev == "added":
             self.add_row(t)
             self.status.setText(f"追加: {t.name}")
@@ -451,15 +468,32 @@ class Main(QMainWindow):
         s = [t for t in self.selected() if t.status != DONE]
         if not s:
             return
-        key, ok = QInputDialog.getText(self, APP_NAME, "ダウンロード用パスワード:",
-                                       QLineEdit.Normal, s[0].key)
-        if not ok:
+        self.ask_key(s)
+
+    def ask_key(self, tasks):
+        """パスワードを聞いて、入れたら再開する"""
+        if getattr(self, "_asking_key", False):
+            self._pending_key.extend(t for t in tasks if t not in self._pending_key)
             return
-        for t in s:
-            if t.status in (RUNNING, RETRYING, QUEUED):
-                t.key = key.strip()
-            else:
-                self.mgr.resume(t, key=key.strip())
+        self._asking_key, self._pending_key = True, list(tasks)
+        try:
+            while self._pending_key:
+                batch = [t for t in self._pending_key if t.status != DONE]
+                self._pending_key = []
+                if not batch:
+                    break
+                names = "\n".join(t.name for t in batch[:5]) + ("\n…" if len(batch) > 5 else "")
+                msg = batch[0].message if batch[0].status == KEY_WAIT and batch[0].message else ""
+                key, ok = QInputDialog.getText(
+                    self, APP_NAME,
+                    f"このファイルはダウンロード用パスワードが必要です。\n{names}\n\n"
+                    + (f"（{msg}）\n" if msg and "入力してください" not in msg else "")
+                    + "パスワード（半角英数1〜4文字）:",
+                    QLineEdit.Normal, batch[0].key)
+                if ok and key.strip():
+                    self.mgr.set_key(batch, key.strip())
+        finally:
+            self._asking_key = False
 
     def act_remove(self):
         s = self.selected()

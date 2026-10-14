@@ -26,6 +26,7 @@ os.environ["XDG_DATA_HOME"] = str(TMP / "xdg")
 
 DATA = {"9001-alpha": os.urandom(4 * 1024 * 1024), "9001-beta": os.urandom(6 * 1024 * 1024)}
 UP = {"next": {}, "buf": {}, "files": {}}
+PW = {"9300-pwa": "pw12", "9300-pwb": "pw34"}     # パスワード付きのページ
 NAMES = {"9001-alpha": "日本語ファイル.mov", "9001-beta": "beta.mp4"}
 
 
@@ -91,10 +92,19 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/set_dlkey.php":
             UP["files"][q["file"][0]]["dlkey"] = q["dlkey"][0]
             return self._send(200, "application/json", b'{"status":0}')
+        if u.path == "/check_dlkey.php":
+            ok = PW.get(q["file"][0]) == q.get("dlkey", [""])[0]
+            return self._send(200, "application/json", b'{"status":0}' if ok else b'{"status":1}')
+        if pid in PW:
+            html = (f'<span id="dl" onclick="download(\'{pid}\', true, false);">{NAMES[pid]}</span>'
+                    '<input type="text" id="dlkey" maxlength="4"><span class="dl_size">1 MB</span>')
+            return self._send(200, "text/html; charset=utf-8", html.encode())
         if pid in DATA:
             html = f'<div id="dl">{NAMES[pid]}</div><span class="dl_size">1 MB</span>'
             return self._send(200, "text/html; charset=utf-8", html.encode())
         if u.path == "/download.php":
+            if q["file"][0] in PW and q.get("dlkey", [""])[0] != PW[q["file"][0]]:
+                return self._send(200, "text/html; charset=UTF-8", "<script>alert('ダウンロードキーが異なります。')</script>".encode())
             data = DATA[q["file"][0]]
             start = 0
             rng = self.headers.get("Range")
@@ -238,6 +248,37 @@ check(w.table.rowCount() == 0, "完了を一覧から消す")
 # --- 状態ファイルが保存されている
 st = json.loads(Path(gigadl.STATE).read_text("utf-8"))
 check(str(dl2) in st["settings"].get("recent_dirs", []), "最近のフォルダが保存される")
+
+# --- パスワードを入れ忘れたとき
+from PySide6.QtWidgets import QInputDialog as _QID  # noqa: E402
+for k in PW:
+    DATA[k] = os.urandom(1024 * 1024 + 3)
+NAMES["9300-pwa"], NAMES["9300-pwb"] = "pw_a.mov", "pw_b.mov"
+asked = []
+# (1) 聞かれたけどキャンセル → 「パスワード待ち」で止まる → 行を選んで右上の欄に入れて「追加」
+_QID.getText = staticmethod(lambda *a, **k: (asked.append(1), ("", False))[1])
+w.urls.setPlainText("https://46.gigafile.nu/9300-pwa")
+w.key.clear()
+w.add_btn.click()
+pa = None
+check(wait_for(lambda: any(t.file_id == "9300-pwa" for t in w.mgr.tasks), 10), "パスワード付きURLを追加")
+pa = next(t for t in w.mgr.tasks if t.file_id == "9300-pwa")
+check(wait_for(lambda: pa.status == engine.KEY_WAIT and asked, 10), "入れ忘れるとすぐパスワードを聞かれる")
+pump(0.3)
+shot("2b_パスワード待ち")
+r = w.row_of[pa.id]
+check("パスワード待ち" in w.table.item(r, 5).text(), "状態が「パスワード待ち」と表示される")
+w.table.selectRow(r)
+w.key.setText("pw12")
+w.add_btn.click()
+check(wait_for(lambda: pa.status == engine.DONE, 30), f"右上の欄に入れて「追加」で再開して完了 {pa.message}")
+check(Path(pa.final_path).read_bytes() == DATA["9300-pwa"], "中身が一致")
+# (2) 聞かれたらそのまま答える
+_QID.getText = staticmethod(lambda *a, **k: ("pw34", True))
+w.urls.setPlainText("https://46.gigafile.nu/9300-pwb")
+w.add_btn.click()
+check(wait_for(lambda: any(t.file_id == "9300-pwb" and t.status == engine.DONE for t in w.mgr.tasks), 30),
+      "聞かれたパスワードに答えるとそのまま完了")
 
 # --- アップロードのタブ
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Ok)
