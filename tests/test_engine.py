@@ -55,7 +55,9 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/1001-single":
             self.send_response(200)
             self.send_header("Set-Cookie", "sess=abc; Path=/")
-            b = f'<div id="dl">素材A.mov</div><span class="dl_size">5 MB</span>'.encode()
+            # パスワード無しでも、ページにはパスワード欄や download('…', true…) の形が含まれることがある
+            b = (f'<div id="dl" onclick="download(\'1001-single\', true, false);">素材A.mov</div>'
+                 f'<input type="hidden" id="dlkey"><span class="dl_size">5 MB</span>').encode()
             self.send_header("Content-Type", "text/html"); self.send_header("Content-Length", str(len(b)))
             self.end_headers(); self.wfile.write(b); return
         if u.path in ("/1001-locked", "/1001-locked2"):
@@ -261,12 +263,16 @@ for nm in ("素材A.mov", "clip1.mp4", "clip2.wav", "secret.zip", "secret2.zip",
     check(p.exists() and hashlib.md5(p.read_bytes()).digest() == hashlib.md5(random_data[fid]).digest(), f"中身一致 {nm}")
 check(HITS.get("1001-single", [None])[1:] and all(h and h.startswith("bytes=") for h in HITS["1001-single"][1:]), "切断後にRangeで続きから")
 check(kw_status == engine.KEY_WAIT and kw_event, "入れ忘れは「パスワード待ち」になり入力を促す")
-check(kw_hits == [], "入れ忘れのときはダウンロードを試さない（失敗回数を増やさない）")
-check("違います" in wrong_msg and wrong_hits == [], "違うパスワードは先に確認して弾く")
+check(kw_hits == [("1001-locked", "")], "入れ忘れのときは鍵なしで1回だけ試して判断する")
+sa = next(t for t in m.tasks if t.name == "素材A.mov")
+check(sa.status == engine.DONE and not sa.needs_key and not any(
+      e == "need_key" and any(x.name == "素材A.mov" for x in d) for e, d in events),
+      "パスワード無しのファイルは、ページに目印があっても「パスワード待ち」にならない")
+check("違います" in wrong_msg and wrong_hits == kw_hits, "違うパスワードは先に確認して弾く")
 check(readd_ok and n_after == n_before, "同じURLをパスワード付きで追加し直すと、その行が再開して完了")
 check(old_wait and old.status == engine.DONE, "古い行でも失敗後にパスワードを入れれば完了")
-check(all(k == KEYS[f] for f, k in LOCKED_DL if f == "1001-locked"),
-      "新しく追加した行は、正しいパスワードのときだけダウンロードする")
+check(all(k in ("", KEYS[f]) for f, k in LOCKED_DL if f == "1001-locked"),
+      "間違ったパスワードではダウンロードを試さない")
 check(t2.status == engine.DONE and HITS["big"] == [f"bytes={paused_at}-"] and paused_at > 0, f"再起動後に続きから再開 (停止位置 {paused_at})")
 check(t3.status == engine.DONE and Path(t3.final_path) == other / "move.bin", "ダウンロード中の保存先変更")
 check(t4.status == engine.QUEUED and Path(t4.dest_dir) == other, "待機中の保存先変更")

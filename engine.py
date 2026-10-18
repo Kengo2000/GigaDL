@@ -246,6 +246,10 @@ class Manager:
         except Exception:
             pass
         for t in self.tasks:
+            # 1.3.2 はページの目印だけで「要パスワード」と誤判定することがあった → 判定をやり直す
+            t.needs_key = False
+            if t.status == KEY_WAIT and not t.key:
+                t.status, t.message = QUEUED, ""
             if t.status == PAUSED and t.part_path.exists():
                 t.done_bytes = t.part_path.stat().st_size
 
@@ -271,7 +275,10 @@ class Manager:
         """URLを解析してタスクを追加（別スレッド）"""
         def work():
             try:
-                files, needs_key = parse_page_ex(url)
+                files, _hint = parse_page_ex(url)
+                # ページの見た目では判断しない（パスワード無しのページにも同じ目印があるため）。
+                # 実際にサーバーに断られたときだけ「パスワード待ち」にする。
+                needs_key = False
             except Exception as ex:
                 self.listener("resolve_error", (url, str(ex)))
                 return
@@ -324,12 +331,8 @@ class Manager:
             if key is not None:
                 task.key = key
             if task.status in (PAUSED, ERROR, KEY_WAIT):
-                if task.needs_key and not task.key:
-                    task.status, task.message = KEY_WAIT, "パスワードを入力してください"
-                    need.append(task)
-                else:
-                    task.status = QUEUED
-                    task.message = ""
+                task.status = QUEUED      # 鍵が要るかどうかはサーバーの返事で判断する
+                task.message = ""
                 self.listener("update", task)
         self.save()
         if need:
@@ -513,9 +516,7 @@ class Manager:
         s.get(t.page_url, timeout=30).raise_for_status()
 
         # パスワード付き：公式サイトと同じく先に確認する（間違いでダウンロードを試さない）
-        if t.needs_key:
-            if not t.key:
-                raise KeyRequired("パスワードを入力してください")
+        if t.needs_key and t.key:
             st = check_dlkey(s, t.page_url, t.file_id, t.key)
             if st == 1:
                 raise KeyRequired("パスワードが違います。入れ直してください")
