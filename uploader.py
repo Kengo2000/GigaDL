@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
 import unicodedata
 import zipfile
@@ -72,6 +73,30 @@ class UploadError(Exception):
 
 class Stopped(Exception):
     pass
+
+
+def _log(msg: str):
+    """gigadl.log（標準エラー）に時刻付きで書く"""
+    try:
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "[upload]", msg, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _short_reason(ex) -> str:
+    """状態欄に出す短い理由"""
+    resp = getattr(ex, "response", None)
+    if resp is not None and getattr(resp, "status_code", None):
+        return f"サーバー応答 {resp.status_code}"
+    if isinstance(ex, requests.exceptions.ContentDecodingError):
+        return str(ex)[:60]
+    if isinstance(ex, requests.exceptions.SSLError):
+        return "暗号化通信のエラー"
+    if isinstance(ex, requests.exceptions.Timeout):
+        return "応答なし（時間切れ）"
+    if isinstance(ex, requests.exceptions.ConnectionError):
+        return "接続が切れました"
+    return type(ex).__name__
 
 
 def valid_dlkey(k: str) -> bool:
@@ -677,12 +702,14 @@ class UploadManager:
                 if t._stop.is_set():
                     break
                 retries += 1
+                why = _short_reason(ex)
+                _log(f"送り直し {retries}回目 {t.name}: {type(ex).__name__}: {ex}")
                 if retries > MAX_RETRIES:
                     t.status, t.message = ERROR, f"接続エラーが続いたため中止: {ex}"
                     break
                 wait = min(30, 2 ** min(retries, 5))
                 t.status = RETRYING
-                t.message = f"{retries}回目の再送まで{wait}秒"
+                t.message = f"{retries}回目の再送まで{wait}秒（{why}）"
                 t.speed = 0
                 self.save()
                 self.listener("up_update", t)
@@ -772,11 +799,17 @@ class UploadManager:
                 body.close()
             # 送り終わって返事が来た分は、一時停止が押されていても必ず記録する
             # （捨てると再開時に同じ分を送り直し、順番違いで最初からになってしまう）
+            if r.status_code >= 400:
+                _log(f"upload_chunk HTTP {r.status_code} server={t.server} chunk={idx}/{t.chunks} "
+                     f"headers={dict(r.headers)} body={r.text[:500]!r}")
             r.raise_for_status()
             try:
                 data = r.json()
             except ValueError:
-                raise requests.exceptions.ContentDecodingError("サーバーの応答を読めませんでした")
+                _log(f"upload_chunk 応答がJSONでない server={t.server} chunk={idx}/{t.chunks} "
+                     f"status={r.status_code} type={r.headers.get('Content-Type')} body={r.text[:500]!r}")
+                head = re.sub(r"\s+", " ", r.text)[:40]
+                raise requests.exceptions.ContentDecodingError(f"サーバーの応答を読めませんでした: {head}")
             if data.get("status") != 0:
                 # 再開した続きが受け付けられない → 一度だけ最初から送り直す
                 if idx > 0 and not t.restarted:
