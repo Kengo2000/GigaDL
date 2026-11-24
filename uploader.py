@@ -841,11 +841,20 @@ class UploadManager:
         self.listener("up_update", t)
         if t.dlkey:
             self._apply_dlkey(t, session)
-        self._verify(t, session)
+        note = ""
+        try:
+            self._verify(t, session)
+        except UploadError:
+            raise
+        except Exception as ex:
+            # 送信自体はURLを受け取って完了している。確認だけできなかった場合は
+            # 送り直さずに完了扱いにする（受け取りページの作りが変わった等）
+            _log(f"確認をスキップ {t.name} url={t.url}: {type(ex).__name__}: {ex}")
+            note = "送信完了（サイズの確認はできませんでした）"
         t.status = DONE
         t.finished_at = time.time()
         t.sent = t.size
-        t.message = ""
+        t.message = note
         if t.is_zip:            # 送り終わったら作業用ZIPを消す
             _unlink(Path(t.path))
 
