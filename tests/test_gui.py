@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 # 設定ファイルをテスト用の場所に
 TMP = Path(tempfile.mkdtemp())
 os.environ["APPDATA"] = str(TMP / "appdata")
+os.environ["GIGADL_NO_UPDATE_CHECK"] = "1"
 os.environ["XDG_DATA_HOME"] = str(TMP / "xdg")
 
 DATA = {"9001-alpha": os.urandom(4 * 1024 * 1024), "9001-beta": os.urandom(6 * 1024 * 1024)}
@@ -279,6 +280,27 @@ w.urls.setPlainText("https://46.gigafile.nu/9300-pwb")
 w.add_btn.click()
 check(wait_for(lambda: any(t.file_id == "9300-pwb" and t.status == engine.DONE for t in w.mgr.tasks), 30),
       "聞かれたパスワードに答えるとそのまま完了")
+
+# --- 新しい版のお知らせ（通信はせず、届いた情報を渡して確かめる）
+_orig_exec = QMessageBox.exec
+_seen = []
+def _fake_exec(box):
+    _seen.append(box.text())
+    for b in box.buttons():
+        if b.text() == "この版は知らせない":
+            b.click()
+    return 0
+QMessageBox.exec = _fake_exec
+w.show_update({"version": "9.9.9", "date": "2099-01-01", "notes": ["テスト用の更新"],
+               "url": "https://example.com/"})
+pump(0.3)
+check(_seen and "9.9.9" in _seen[0] and "テスト用の更新" in _seen[0],
+      "新しい版があると、版番号と内容を知らせる")
+check(w.mgr.settings.get("skip_version") == "9.9.9" and not w.update_btn.isVisible(),
+      "「この版は知らせない」を選ぶと、その版は知らせなくなる")
+QMessageBox.exec = _orig_exec
+lifetimes = [w.up_tab.lifetime.itemData(i) for i in range(w.up_tab.lifetime.count())]
+check(150 in lifetimes, "保持期限に150日を選べる")
 
 # --- アップロードのタブ
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Ok)

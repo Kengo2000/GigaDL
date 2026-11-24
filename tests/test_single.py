@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 tmp = tempfile.mkdtemp()
-env = dict(os.environ, HOME=tmp, USERPROFILE=tmp, APPDATA=str(Path(tmp) / "appdata"),
+env = dict(os.environ, GIGADL_NO_UPDATE_CHECK="1", HOME=tmp, USERPROFILE=tmp, APPDATA=str(Path(tmp) / "appdata"),
            LOCALAPPDATA=str(Path(tmp) / "local"), XDG_DATA_HOME=str(Path(tmp) / "xdg"))
 FAIL = []
 

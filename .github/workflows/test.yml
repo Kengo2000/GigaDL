@@ -59,6 +59,11 @@ jobs:
         shell: pwsh
         run: '& "$env:LOCALAPPDATA\GigaDL\venv\Scripts\python.exe" tests\run.py tests\test_upload.py'
 
+      - name: お知らせ機能のテスト
+        if: success() || failure()
+        shell: pwsh
+        run: '& "$env:LOCALAPPDATA\GigaDL\venv\Scripts\python.exe" tests\run.py tests\test_update.py'
+
       - name: 画面のテスト
         if: success() || failure()
         shell: pwsh
@@ -93,6 +98,9 @@ jobs:
       - name: アップロード機能のテスト
         if: success() || failure()
         run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/run.py tests/test_upload.py'
+      - name: お知らせ機能のテスト
+        if: success() || failure()
+        run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/run.py tests/test_update.py'
       - name: 画面のテスト
         if: success() || failure()
         run: '"$HOME/Library/Application Support/GigaDL/venv/bin/python" tests/run.py tests/test_gui.py'

@@ -98,7 +98,7 @@ if ($py) {
 
 # ------------------------------------------------------------ 配置と仮想環境
 New-Item -ItemType Directory -Force -Path $AppCode | Out-Null
-foreach ($f in 'engine.py', 'gigadl.py', 'platform_util.py', 'make_icon.py', 'uploader.py', 'upload_ui.py') {
+foreach ($f in 'engine.py', 'gigadl.py', 'platform_util.py', 'make_icon.py', 'uploader.py', 'upload_ui.py', 'update_check.py') {
     Copy-Item -Force (Join-Path $Src $f) $AppCode
 }
 

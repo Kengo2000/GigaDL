@@ -33,7 +33,7 @@ echo "Python: $PY ($("$PY" --version))"
 
 # --- コード配置と仮想環境
 mkdir -p "$APPCODE"
-cp "$SRC/engine.py" "$SRC/gigadl.py" "$SRC/platform_util.py" "$SRC/make_icon.py" "$SRC/uploader.py" "$SRC/upload_ui.py" "$APPCODE/"
+cp "$SRC/engine.py" "$SRC/gigadl.py" "$SRC/platform_util.py" "$SRC/make_icon.py" "$SRC/uploader.py" "$SRC/upload_ui.py" "$SRC/update_check.py" "$APPCODE/"
 if [ ! -x "$VENV/bin/python" ]; then
   echo "仮想環境を作成中…"
   "$PY" -m venv "$VENV"

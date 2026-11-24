@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 
 import engine
 import platform_util as pu
+import update_check
 import uploader
 from upload_ui import UploadTab
 from engine import DONE, ERROR, KEY_WAIT, MOVING, PAUSED, QUEUED, RETRYING, RUNNING, human
@@ -176,6 +177,14 @@ class Main(QMainWindow):
 
         self.status = QLabel()
         self.statusBar().addWidget(self.status, 1)
+        # 新しい版があるときだけ出るボタン（右下）
+        self.update_btn = QPushButton()
+        self.update_btn.setFlat(True)
+        self.update_btn.setStyleSheet("color:#e5833d; font-weight:bold;")
+        self.update_btn.clicked.connect(lambda: self.show_update(self._update_info, manual=True))
+        self.update_btn.hide()
+        self.statusBar().addPermanentWidget(self.update_btn)
+        self._update_info = None
         self.up_tab = UploadTab(self.up, self.status)
         self.tabs.addTab(self.up_tab, "アップロード")
         try:
@@ -196,6 +205,67 @@ class Main(QMainWindow):
         QTimer.singleShot(300, self.mgr.startup)
         QTimer.singleShot(350, self.up.startup)
         QTimer.singleShot(400, self.grab_clipboard)
+
+        # 新しい版のお知らせ：起動して少ししてから、その後は1日1回
+        QTimer.singleShot(5000, self.check_update)
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.check_update)
+        self.update_timer.start(24 * 3600 * 1000)
+
+    # ----------------------------------------------------- 新しい版のお知らせ
+    def check_update(self):
+        import os
+        import threading
+        if os.environ.get("GIGADL_NO_UPDATE_CHECK"):
+            return
+        skip = str(self.mgr.settings.get("skip_version", ""))
+
+        def work():
+            info = update_check.check(pu.APP_VERSION, skip)
+            if info:
+                self.bridge.event.emit("update_available", info)
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_update(self, info, manual=False):
+        if not info:
+            return
+        v = str(info.get("version"))
+        self._update_info = info
+        self.update_btn.setText(f"新しい版 {v} があります")
+        self.update_btn.show()
+        if not manual:
+            if getattr(self, "_update_shown", "") == v:   # 同じ版の画面は1回だけ自動で出す
+                return
+            self._update_shown = v
+            notify(f"{APP_NAME} {v} が出ています", "右下の「新しい版があります」から入手できます")
+        text = f"新しい GigaDL {v}"
+        if info.get("date"):
+            text += f"（{info['date']}）"
+        text += f" が出ています。\n今お使いの版: {pu.APP_VERSION}"
+        notes = info.get("notes") or []
+        if isinstance(notes, str):
+            notes = [notes]
+        if notes:
+            text += "\n\n" + "\n".join(f"・{n}" for n in notes[:8])
+        text += ("\n\n入手したzipを解凍し、いつもと同じくインストーラを実行すると更新できます。"
+                 "（設定や途中のダウンロード／アップロードはそのまま残ります）")
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Information)
+        box.setText(text)
+        b_open = box.addButton("ダウンロードページを開く", QMessageBox.AcceptRole) if info.get("url") else None
+        box.addButton("あとで", QMessageBox.RejectRole)
+        b_skip = box.addButton("この版は知らせない", QMessageBox.DestructiveRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if b_open is not None and clicked is b_open:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl(info["url"]))
+        elif clicked is b_skip:
+            self.mgr.settings["skip_version"] = v
+            self.mgr.save()
+            self.update_btn.hide()
 
     # ----------------------------------------------------- 入力系
     def grab_clipboard(self):
@@ -423,6 +493,9 @@ class Main(QMainWindow):
     # ----------------------------------------------------- エンジンからのイベント
     def on_event(self, ev, t):
         if getattr(self, "_closing", False):      # 閉じた後に届いた知らせは無視する
+            return
+        if ev == "update_available":
+            QTimer.singleShot(0, lambda i=t: self.show_update(i))
             return
         if ev.startswith("up_"):
             self.up_tab.on_event(ev, t)
