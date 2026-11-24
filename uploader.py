@@ -26,7 +26,7 @@ import engine
 
 TOP_URL = "https://gigafile.nu/"
 UP_CHUNK = 100 * 1024 * 1024        # 公式と同じ100MB
-LIFETIMES = (3, 5, 7, 14, 30, 60, 100)
+LIFETIMES = (3, 5, 7, 14, 30, 60, 100, 150)
 MAX_RETRIES = 30
 DLKEY_RE = re.compile(r"^[0-9A-Za-z]{1,4}$")
 
